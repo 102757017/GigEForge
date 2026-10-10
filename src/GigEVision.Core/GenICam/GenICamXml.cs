@@ -1,4 +1,3 @@
-using System;
 using System.Globalization;
 using System.Text;
 using GigEVision.Core.Camera;
@@ -8,9 +7,14 @@ namespace GigEVision.Core.GenICam;
 /// <summary>
 /// GenICam GenApi XML 生成器（GenICam 1.1 RegisterDescription，命名空间
 /// http://www.genicam.org/GenApi/Version_1_1）。
-/// 结构按契约第 8 节：Root → DeviceControl / ImageFormatControl / AcquisitionControl；
-/// 寄存器地址与 GigE Vision 引导区 / 设备自定义区一一对应。
+/// 结构按契约第 8 节：Root → DeviceControl / ImageFormatControl / AcquisitionControl / TransportLayer；
+/// 设备信息 StringReg 对齐 GigE Vision 标准引导区地址（0x48/0x68/0x88/0xA8/0xD8/0xE8），
+/// 传输层特性（GevSCPHostPort 等）与 <see cref="GigEVision.Core.Protocol.Gvcp.GevRegisters"/> 流通道寄存器一一对应，
+/// 缺失时 Aravis 会注入同名默认定义，显式声明可让 pylon / VisionMaster 等客户端直接使用。
 /// 元素顺序遵循 GenApi 1.1 schema（NodeBase 元素在前，寄存器元素在后）。
+/// 注意：文件末尾必须包含 <c>&lt;Port Name="Device"/&gt;</c> 节点——所有寄存器节点通过
+/// <c>&lt;pPort&gt;Device&lt;/pPort&gt;</c> 引用它，缺失时 GenApi 报 "Port not found for node"，
+/// 客户端将无法打开设备（Aravis 官方 fake camera XML 亦包含该节点）。
 /// </summary>
 public static class GenICamXml
 {
@@ -37,12 +41,12 @@ public static class GenICamXml
         sb.Append("<RegisterDescription\n");
         sb.Append("    ModelName=\"GigEForge-VirtualCam\"\n");
         sb.Append("    VendorName=\"").Append(Esc(id.ManufacturerName)).Append("\"\n");
-        sb.Append("    StandardNameSpace=\"None\"\n");
+        sb.Append("    StandardNameSpace=\"None\"\n");   // 与 Aravis fake camera 一致（已实测可解析）；勿改 "Yes"
         sb.Append("    SchemaMajorVersion=\"1\"\n");
         sb.Append("    SchemaMinorVersion=\"1\"\n");
         sb.Append("    SchemaSubMinorVersion=\"0\"\n");
         sb.Append("    MajorVersion=\"1\"\n");
-        sb.Append("    MinorVersion=\"0\"\n");
+        sb.Append("    MinorVersion=\"1\"\n");
         sb.Append("    SubMinorVersion=\"0\"\n");
         sb.Append("    ProductGuid=\"").Append(ProductGuid).Append("\"\n");
         sb.Append("    VersionGuid=\"").Append(VersionGuid).Append("\"\n");
@@ -51,16 +55,19 @@ public static class GenICamXml
         sb.Append("    xsi:schemaLocation=\"").Append(XmlNs).Append(' ').Append(SchemaLocation).Append("\">\n");
 
         // ============ Root ============
-        Category(sb, "Root", "DeviceControl", "ImageFormatControl", "AcquisitionControl");
+        Category(sb, "Root", "DeviceControl", "ImageFormatControl", "AcquisitionControl", "TransportLayer");
 
-        // ============ DeviceControl（StringReg×5：0x8/0x48/0x88/0xF8/0xC8，RO） ============
+        // ============ DeviceControl（StringReg，RO；地址 = GigE Vision 标准引导区） ============
         Category(sb, "DeviceControl",
-            "DeviceVendorName", "DeviceModelName", "DeviceVersion", "DeviceID", "DeviceFirmwareVersion");
-        StringReg(sb, "DeviceVendorName", 0x00000008, 32);
-        StringReg(sb, "DeviceModelName", 0x00000048, 32);
+            "DeviceVendorName", "DeviceModelName", "DeviceVersion", "DeviceFirmwareVersion",
+            "DeviceManufacturerInfo", "DeviceID", "DeviceUserID");
+        StringReg(sb, "DeviceVendorName", 0x00000048, 32);
+        StringReg(sb, "DeviceModelName", 0x00000068, 32);
         StringReg(sb, "DeviceVersion", 0x00000088, 32);
-        StringReg(sb, "DeviceID", 0x000000F8, 16);
-        StringReg(sb, "DeviceFirmwareVersion", 0x000000C8, 32);
+        StringReg(sb, "DeviceFirmwareVersion", 0x00000088, 32);      // 与 DeviceVersion 同区（别名）
+        StringReg(sb, "DeviceManufacturerInfo", 0x000000A8, 48);
+        StringReg(sb, "DeviceID", 0x000000D8, 16);
+        StringReg(sb, "DeviceUserID", 0x000000E8, 64);
 
         // ============ ImageFormatControl ============
         Category(sb, "ImageFormatControl", "Width", "Height", "PixelFormat", "PayloadSize", "TestPattern");
@@ -88,6 +95,46 @@ public static class GenICamXml
         Float(sb, "AcquisitionFrameRate", 1, 120, "AcquisitionFrameRateReg");
         FloatReg(sb, "AcquisitionFrameRateReg", 0x00140014);        // RW
 
+        // ============ TransportLayer（GigE Vision 传输层特性，地址 = 流通道 0 引导寄存器） ============
+        Category(sb, "TransportLayer",
+            "GevSCPHostPort", "GevSCPSPacketSize", "GevSCPSFireTestPacket", "GevSCPSDoNotFragment",
+            "GevSCPD", "GevSCDA", "GevSCSP");
+        // TLParamsLocked：流参数锁（客户端流配置期间置 1）；虚拟节点恒 0 = 不锁
+        sb.Append("  <Integer Name=\"TLParamsLocked\" NameSpace=\"Custom\">\n");
+        sb.Append("    <Visibility>Invisible</Visibility>\n");
+        sb.Append("    <Value>0</Value>\n");
+        sb.Append("    <Min>0</Min>\n");
+        sb.Append("    <Max>1</Max>\n");
+        sb.Append("  </Integer>\n");
+        // GevSCPHostPort：GVSP 目的端口（0x0D00 低 16 位）
+        Integer(sb, "GevSCPHostPort", null, null, null, "GevSCPHostPortReg", locked: true);
+        MaskedIntReg(sb, "GevSCPHostPortReg", 0x00000D00, "RW", lsb: 31, msb: 16);
+        // GevSCPSPacketSize：GVSP 包大小（0x0D04 低 16 位，含 IP/UDP 28B 头；设备侧会夹紧并回写）
+        Integer(sb, "GevSCPSPacketSize", 604, 16028, 4, "GevSCPSPacketSizeReg", locked: true);
+        MaskedIntReg(sb, "GevSCPSPacketSizeReg", 0x00000D04, "RW", lsb: 31, msb: 16);
+        // GevSCPSFireTestPacket：命令（写 0x0D04 bit31，设备回发测试包供路径 MTU 探测，自清零）
+        Command(sb, "GevSCPSFireTestPacket", "GevSCPSFireTestPacketReg", locked: true);
+        MaskedIntReg(sb, "GevSCPSFireTestPacketReg", 0x00000D04, "RW", bit: 0);
+        // GevSCPSDoNotFragment：布尔（0x0D04 bit30，本设备不分片，仅保留位状态）
+        sb.Append("  <Boolean Name=\"GevSCPSDoNotFragment\" NameSpace=\"Standard\">\n");
+        sb.Append("    <pIsLocked>TLParamsLocked</pIsLocked>\n");
+        sb.Append("    <pValue>GevSCPSDoNotFragmentReg</pValue>\n");
+        sb.Append("  </Boolean>\n");
+        MaskedIntReg(sb, "GevSCPSDoNotFragmentReg", 0x00000D04, "RW", bit: 1);
+        // GevSCPD：包间延迟（微秒，0x0D08 全 32 位）
+        Integer(sb, "GevSCPD", null, null, null, "GevSCPDReg", locked: true);
+        IntReg(sb, "GevSCPDReg", 0x00000D08, "RW");
+        // GevSCDA：GVSP 目的地 IP（0x0D18 全 32 位大端；0 = 使用控制者 IP）
+        Integer(sb, "GevSCDA", null, null, null, "GevSCDAReg", locked: true);
+        IntReg(sb, "GevSCDAReg", 0x00000D18, "RW");
+        // GevSCSP：GVSP 源端口（0x0D1C 低 16 位，RO）
+        Integer(sb, "GevSCSP", null, null, null, "GevSCSPReg", locked: true);
+        MaskedIntReg(sb, "GevSCSPReg", 0x00000D1C, "RO", lsb: 31, msb: 16);
+
+        // ============ 设备端口（所有寄存器节点的 pPort 目标，缺失会导致 "Port not found for node"） ============
+        sb.Append("  <Port Name=\"Device\" NameSpace=\"Standard\">\n");
+        sb.Append("  </Port>\n");
+
         sb.Append("</RegisterDescription>\n");
         return sb.ToString();
     }
@@ -114,15 +161,44 @@ public static class GenICamXml
         sb.Append("  </StringReg>\n");
     }
 
-    /// <summary>Integer 特性节点：pValue 指向 IntReg，可带 Min/Max/Inc。</summary>
-    private static void Integer(StringBuilder sb, string name, int? min, int? max, int? inc, string pValue)
+    /// <summary>Integer 特性节点：pValue 指向寄存器节点，可带 Min/Max/Inc 与 pIsLocked。</summary>
+    private static void Integer(StringBuilder sb, string name, int? min, int? max, int? inc, string pValue, bool locked = false)
     {
         sb.Append("  <Integer Name=\"").Append(name).Append("\" NameSpace=\"Standard\">\n");
+        if (locked) sb.Append("    <pIsLocked>TLParamsLocked</pIsLocked>\n");
         sb.Append("    <pValue>").Append(pValue).Append("</pValue>\n");
         if (min.HasValue) sb.Append("    <Min>").Append(min.Value).Append("</Min>\n");
         if (max.HasValue) sb.Append("    <Max>").Append(max.Value).Append("</Max>\n");
         if (inc.HasValue) sb.Append("    <Inc>").Append(inc.Value).Append("</Inc>\n");
         sb.Append("  </Integer>\n");
+    }
+
+    /// <summary>
+    /// MaskedIntReg 节点：Bit（单 bit）或 LSB/MSB（位域）二选一。
+    /// 位序遵循 GenApi 标准（BigEndian 寄存器 bit0 = 最高有效位）：
+    /// LSB=31/MSB=16 即 32 位寄存器的低 16 位，Bit 0 即最高位（0x80000000）。
+    /// </summary>
+    private static void MaskedIntReg(StringBuilder sb, string name, uint address, string access, int lsb = -1, int msb = -1, int bit = -1)
+    {
+        sb.Append("  <MaskedIntReg Name=\"").Append(name).Append("\" NameSpace=\"Custom\">\n");
+        AppendAddress(sb, address);
+        sb.Append("    <Length>4</Length>\n");
+        sb.Append("    <AccessMode>").Append(access).Append("</AccessMode>\n");
+        sb.Append("    <pPort>Device</pPort>\n");
+        sb.Append("    <Cachable>NoCache</Cachable>\n");
+        if (bit >= 0)
+        {
+            sb.Append("    <Bit>").Append(bit).Append("</Bit>\n");
+        }
+        else
+        {
+            sb.Append("    <LSB>").Append(lsb).Append("</LSB>\n");
+            sb.Append("    <MSB>").Append(msb).Append("</MSB>\n");
+        }
+
+        sb.Append("    <Sign>Unsigned</Sign>\n");
+        sb.Append("    <Endianess>BigEndian</Endianess>\n");
+        sb.Append("  </MaskedIntReg>\n");
     }
 
     /// <summary>IntReg 节点：Sign=Unsigned / Endianess=BigEndian（GenICam 1.1 拼写），可 Invisible。</summary>
@@ -154,9 +230,10 @@ public static class GenICamXml
     }
 
     /// <summary>Command 特性节点：写 CommandValue 到 CommandReg。</summary>
-    private static void Command(StringBuilder sb, string name, string pValue)
+    private static void Command(StringBuilder sb, string name, string pValue, bool locked = false)
     {
         sb.Append("  <Command Name=\"").Append(name).Append("\" NameSpace=\"Standard\">\n");
+        if (locked) sb.Append("    <pIsLocked>TLParamsLocked</pIsLocked>\n");
         sb.Append("    <pValue>").Append(pValue).Append("</pValue>\n");
         sb.Append("    <CommandValue>1</CommandValue>\n");
         sb.Append("  </Command>\n");

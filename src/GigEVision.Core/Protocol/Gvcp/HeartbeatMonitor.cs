@@ -26,11 +26,11 @@ public sealed class HeartbeatMonitor : IDisposable
     public HeartbeatMonitor(TimeSpan initialTimeout)
     {
         _timeout = initialTimeout < TimeSpan.Zero ? TimeSpan.Zero : initialTimeout;
-        _timer = new Timer(OnTick, null, Timeout.InfiniteTimeSpan, Timeout.InfiniteTimeSpan);
+        _timer = new Timer(OnTick, null, System.Threading.Timeout.InfiniteTimeSpan, System.Threading.Timeout.InfiniteTimeSpan);
     }
 
     /// <summary>心跳超时时间。</summary>
-    public TimeSpan TimeoutPeriod
+    public TimeSpan Timeout
     {
         get
         {
@@ -82,7 +82,7 @@ public sealed class HeartbeatMonitor : IDisposable
             _armed = false;
         }
 
-        _timer.Change(Timeout.InfiniteTimeSpan, Timeout.InfiniteTimeSpan);
+        _timer.Change(System.Threading.Timeout.InfiniteTimeSpan, System.Threading.Timeout.InfiniteTimeSpan);
     }
 
     private void OnTick(object? state)

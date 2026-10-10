@@ -549,8 +549,8 @@ public class SimulatorPage : UserControl
         }
 
         _statusLabel.Text = camera.IsStreaming
-            ? $"GVCP 3956 在线 · 采集中 {camera.Stats.CurrentFps:0.0} fps · GenICam local;GigEForge.xml"
-            : "GVCP 3956 在线 · GenICam local;GigEForge.xml";
+            ? $"GVCP 3956 在线 · 采集中 {camera.Stats.CurrentFps:0.0} fps · GenICam local:///GigEForge.xml"
+            : "GVCP 3956 在线 · GenICam local:///GigEForge.xml";
     }
 
     /// <summary>采集启停变化（含客户端写寄存器触发，跨线程）→ 切回 UI 线程同步按钮。</summary>

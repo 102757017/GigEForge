@@ -20,7 +20,7 @@ public enum GvcpCommand : ushort
     /// <summary>应答待发（TVU 场景占位，本实现仅保留常量）。</summary>
     PendingAck = 0x0006,
 
-    /// <summary>流重发请求（到达 GVCP 端口，转交 GVSP 发送器处理）。</summary>
+    /// <summary>流重发请求（payload = block_id u32 + first u32 + last u32；到达 GVCP 端口，转交 GVSP 发送器处理）。</summary>
     ResendCmd = 0x0040,
 
     /// <summary>流重发应答（本实现不发送该 ACK，重发直接以数据包形式回应）。</summary>
@@ -32,26 +32,26 @@ public enum GvcpCommand : ushort
     /// <summary>读寄存器应答（payload = N×u32 值）。</summary>
     ReadRegAck = 0x0081,
 
-    /// <summary>写寄存器（payload = 地址/值对）。</summary>
+    /// <summary>写寄存器（payload = N×(地址 u32 + 值 u32)）。</summary>
     WriteRegCmd = 0x0082,
 
-    /// <summary>写寄存器应答（payload = index u16 = 写入个数）。</summary>
+    /// <summary>写寄存器应答（payload = index u32 = 成功写入个数）。</summary>
     WriteRegAck = 0x0083,
 
-    /// <summary>读内存（payload = addr u32 + count u16）。</summary>
+    /// <summary>读内存（payload = 地址 u32 + 数量 u32，数量按 4 字节对齐向上取整）。</summary>
     ReadMemCmd = 0x0084,
 
-    /// <summary>读内存应答（payload = index u16 + 数据）。</summary>
+    /// <summary>读内存应答（payload = 地址 u32 回显 + 数据）。</summary>
     ReadMemAck = 0x0085,
 
-    /// <summary>写内存（payload = addr u32 + 数据）。</summary>
+    /// <summary>写内存（payload = 地址 u32 + 数据，数据按 4 字节对齐填充）。</summary>
     WriteMemCmd = 0x0086,
 
-    /// <summary>写内存应答（payload = index u16 = 写入字节数）。</summary>
+    /// <summary>写内存应答（payload = 地址 u32 回显）。</summary>
     WriteMemAck = 0x0087,
 }
 
-/// <summary>GVCP 全局状态码（ACK 包 status 字段，大端 u16，紧跟包头）。</summary>
+/// <summary>GVCP 全局状态码（应答包 status 字段，即包头前两字节：成功 0x0000，错误 0x8xxx）。</summary>
 public enum GevStatus : ushort
 {
     /// <summary>成功。</summary>

@@ -9,6 +9,6 @@
     <Description>GigE Vision virtual camera core: GVCP/GVSP protocol stack, imaging and push SDK</Description>
   </PropertyGroup>
   <ItemGroup>
-    <PackageReference Include="System.Drawing.Common" Version="10.0.0" />
+    <PackageReference Include="System.Drawing.Common" Version="8.0.0" />
   </ItemGroup>
 </Project>

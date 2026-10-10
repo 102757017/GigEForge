@@ -161,6 +161,43 @@ public sealed class GvspTransmitter : IDisposable
     }
 
     /// <summary>
+    /// 发送 GVSP 测试包（FireTestPacket 路径 MTU 探测用）：单个 Data 包，
+    /// UDP 载荷 = packetSize 字节（GVSP 包大小，含 8B GVSP 包头）。
+    /// 客户端只校验收到的字节数，不解析内容。不写入缓存、不计入统计。
+    /// </summary>
+    public void SendTestPacket(IPAddress destIp, int destPort, int packetSize)
+    {
+        ArgumentNullException.ThrowIfNull(destIp);
+
+        UdpClient? udp;
+        lock (_sendLock)
+        {
+            udp = _udp;
+        }
+
+        if (udp is null)
+        {
+            Log?.Invoke("测试包发送跳过：流通道未启动");
+            return;
+        }
+
+        int chunk = Math.Max(0, packetSize - GvspPacket.HeaderSize);
+        var packet = GvspPacket.BuildData(1, blockId: 0, new byte[chunk]);
+        try
+        {
+            udp.Send(packet, packet.Length, new IPEndPoint(destIp, destPort));
+        }
+        catch (SocketException ex)
+        {
+            Log?.Invoke($"GVSP 测试包发送失败: {ex.SocketErrorCode}");
+        }
+        catch (ObjectDisposedException)
+        {
+            // 流通道已停止，忽略
+        }
+    }
+
+    /// <summary>
     /// 处理重发请求：从 PacketCache 取 blockId 的包列表，
     /// 重发 [firstId..lastId]（lastId=0xFFFF 表示直到帧尾）。
     /// packet_id 与缓存下标一致：0=Leader，1..N=Data，N+1=Trailer。

@@ -3,6 +3,7 @@
 // 客户端（Basler pylon / Harvesters / VisionMaster / AravisSharp）搜索 "GigEForge"
 // 相机即可按帧率采集内置彩条测试图案，无需手动推送任何图像。
 using System.Net.NetworkInformation;
+using System.Threading;
 using GigEVision.Core.Imaging;
 using GigEVision.Core.Sdk;
 
@@ -34,8 +35,17 @@ foreach (var ip in GetLocalIpv4Addresses())
 Console.WriteLine();
 Console.WriteLine("在 Basler pylon / Harvesters / VisionMaster / AravisSharp 客户端中");
 Console.WriteLine("搜索 GigE 相机，应能发现名为 \"GigEForgeCam\" 的虚拟相机；");
-Console.WriteLine("内置彩条测试图案以 30 fps 持续流出。按回车键退出…");
-Console.ReadLine();
+Console.WriteLine("内置彩条测试图案以 30 fps 持续流出。按 Ctrl+C 退出…");
+
+// Ctrl+C 优雅退出：不用 Console.ReadLine()——stdin 被重定向/非 TTY 时它会立即返回导致进程秒退，
+// 改为等待 Ctrl+C 触发的取消信号
+using var exitCts = new CancellationTokenSource();
+Console.CancelKeyPress += (_, e) =>
+{
+    e.Cancel = true;             // 阻止默认的进程立即终止，先走 Stop() 清理
+    exitCts.Cancel();
+};
+exitCts.Token.WaitHandle.WaitOne();
 
 // 5. 下线相机并释放资源
 server.Stop();

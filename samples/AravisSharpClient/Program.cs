@@ -14,7 +14,6 @@
 // ——————————————————————————————————————————————————————————————————————————————
 using System.Text;
 using AravisSharp;
-using AravisSharp.Native;
 
 if (args.Length == 0)
 {
@@ -101,7 +100,7 @@ static int AcquireOnce(string deviceId)
         return 1;
     }
 
-    ReadOnlySpan<byte> data = buffer.GetDataSpan();
+    Span<byte> data = buffer.GetDataSpan();
     int expected = buffer.Width * buffer.Height;
     if (data.Length != expected)
     {

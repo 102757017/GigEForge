@@ -180,7 +180,11 @@ public sealed class RegisterMap
         return GevStatus.Success;
     }
 
-    /// <summary>读内存区（address 与 dest.Length 均须 4 字节对齐，区间必须完整落在同一内存区内）。</summary>
+    /// <summary>
+    /// 读内存区（address 与 dest.Length 均须 4 字节对齐）。优先整段命中同一内存区直接拷贝；
+    /// 跨区或含未定义空洞的区间按 4 字节字逐字组装：命中内存区取实值、精确命中寄存器取其大端值、
+    /// 其余以 0 填充（Aravis 等客户端会探测标准引导区中本设备未实现的位置，回 0 即可）。
+    /// </summary>
     public GevStatus ReadMemory(uint address, Span<byte> dest)
     {
         if (dest.Length == 0)
@@ -196,18 +200,48 @@ public sealed class RegisterMap
         lock (_lock)
         {
             var entry = FindContainingNoLock(address);
-            if (entry is null || !entry.IsMemory ||
-                (ulong)address + (uint)dest.Length > (ulong)entry.Address + entry.Size)
+            if (entry is not null && entry.IsMemory &&
+                (ulong)address + (uint)dest.Length <= (ulong)entry.Address + entry.Size)
             {
-                return GevStatus.InvalidAddress;
+                entry.Data!.AsSpan((int)(address - entry.Address), dest.Length).CopyTo(dest);
+                return GevStatus.Success;
             }
 
-            entry.Data!.AsSpan((int)(address - entry.Address), dest.Length).CopyTo(dest);
+            // 逐字组装回退（dest 初始为 0，未命中的字保持 0）
+            for (int offset = 0; offset < dest.Length; offset += 4)
+            {
+                uint wordAddress = address + (uint)offset;
+                var wordEntry = FindContainingNoLock(wordAddress);
+                if (wordEntry is null)
+                {
+                    continue;
+                }
+
+                Span<byte> target = dest.Slice(offset, 4);
+                if (wordEntry.IsMemory)
+                {
+                    if ((ulong)wordAddress + 4 <= (ulong)wordEntry.Address + wordEntry.Size)
+                    {
+                        wordEntry.Data!.AsSpan((int)(wordAddress - wordEntry.Address), 4).CopyTo(target);
+                    }
+                }
+                else if (wordEntry.Address == wordAddress)
+                {
+                    WriteU32BigEndian(target, wordEntry.Value);
+                }
+            }
+
             return GevStatus.Success;
         }
     }
 
-    /// <summary>写内存区（address 与 data.Length 均须 4 字节对齐；只读区回 WriteProtect）。</summary>
+    /// <summary>
+    /// 写内存区（address 与 data.Length 均须 4 字节对齐；只读区回 WriteProtect）。
+    /// 整段命中单一内存区时直接拷贝；否则（命中 4 字节寄存器 / 混合区域）按 4 字节字逐字写入：
+    /// 寄存器走 <see cref="WriteRegister"/> 语义（validate / onWrite / RegisterWritten 照常触发），
+    /// 内存区按字拷贝。Aravis 非 legacy schema（≥1.1.0）的 GenICam 端口写全部走 WriteMem，
+    /// 因此对寄存器地址的 WriteMem 必须被支持。
+    /// </summary>
     public GevStatus WriteMemory(uint address, ReadOnlySpan<byte> data)
     {
         if (data.Length == 0)
@@ -220,13 +254,56 @@ public sealed class RegisterMap
             return GevStatus.BadAlignment;
         }
 
+        // 快路径：整段落在同一内存区
+        var direct = WriteMemoryRegion(address, data);
+        if (direct.HasValue)
+        {
+            return direct.Value;
+        }
+
+        // 慢路径：逐 4 字节字写入（寄存器 / 内存区混合；不持锁调用公开方法，避免重入死锁）
+        for (int offset = 0; offset < data.Length; offset += 4)
+        {
+            uint wordAddress = address + (uint)offset;
+            RegisterEntry? entry;
+            bool fits;
+            lock (_lock)
+            {
+                entry = FindContainingNoLock(wordAddress);
+                fits = entry is not null && (entry.IsMemory
+                    ? (ulong)wordAddress + 4 <= (ulong)entry.Address + entry.Size
+                    : entry.Address == wordAddress);
+            }
+
+            if (entry is null || !fits)
+            {
+                return GevStatus.InvalidAddress;
+            }
+
+            GevStatus st = entry.IsMemory
+                ? WriteMemory(wordAddress, data.Slice(offset, 4))
+                : WriteRegister(wordAddress, ReadU32BigEndian(data.Slice(offset, 4)));
+            if (st != GevStatus.Success)
+            {
+                return st;
+            }
+        }
+
+        return GevStatus.Success;
+    }
+
+    /// <summary>
+    /// 整段写入单一内存区：命中返回写入状态（Success / WriteProtect），未命中或不完整覆盖返回 null（走逐字路径）。
+    /// </summary>
+    private GevStatus? WriteMemoryRegion(uint address, ReadOnlySpan<byte> data)
+    {
         lock (_lock)
         {
             var entry = FindContainingNoLock(address);
             if (entry is null || !entry.IsMemory ||
                 (ulong)address + (uint)data.Length > (ulong)entry.Address + entry.Size)
             {
-                return GevStatus.InvalidAddress;
+                return null;
             }
 
             if (entry.Access == RegisterAccess.ReadOnly)
@@ -238,6 +315,10 @@ public sealed class RegisterMap
             return GevStatus.Success;
         }
     }
+
+    /// <summary>大端读 u32（WriteMem 逐字路径的寄存器取值）。</summary>
+    private static uint ReadU32BigEndian(ReadOnlySpan<byte> src)
+        => (uint)((src[0] << 24) | (src[1] << 16) | (src[2] << 8) | src[3]);
 
     /// <summary>内部写入：绕过只读保护（初始化名称区 / 灌入 XML blob 用）。
     /// 区域未定义时静默忽略；数据越过区域末尾时截断，不抛异常。</summary>
@@ -299,14 +380,13 @@ public sealed class RegisterMap
             return null;
         }
 
-        // floor 查找：<= address 的最近键（SortedDictionary 有序，反向遍历首个 <= 即 floor；
-        // 前向遍历遇首个 > address 的键即可提前结束，因其后键更大）。
-        KeyValuePair<uint, RegisterEntry>? floor = null;
+        // SortedDictionary 无 GetViewBetween；按排序顺序取最后一个 key <= address 的条目（floor）。
+        RegisterEntry? floor = null;
         foreach (var pair in _entries)
         {
             if (pair.Key <= address)
             {
-                floor = pair;
+                floor = pair.Value;
             }
             else
             {
@@ -319,8 +399,16 @@ public sealed class RegisterMap
             return null;
         }
 
-        var entry = floor.Value.Value;
-        return (ulong)address < (ulong)floor.Value.Key + entry.Size ? entry : null;
+        return (ulong)address < (ulong)floor.Address + floor.Size ? floor : null;
+    }
+
+    /// <summary>大端写 u32 到目标字节片（内存读路径的寄存器取值）。</summary>
+    private static void WriteU32BigEndian(Span<byte> dest, uint value)
+    {
+        dest[0] = (byte)(value >> 24);
+        dest[1] = (byte)(value >> 16);
+        dest[2] = (byte)(value >> 8);
+        dest[3] = (byte)value;
     }
 
     /// <summary>查找与 [address, address+size) 有任意重叠的既有条目（调用方须持锁）。</summary>

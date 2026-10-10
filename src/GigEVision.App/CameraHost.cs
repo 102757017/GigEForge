@@ -108,7 +108,7 @@ public static class CameraHost
 
     /// <summary>
     /// 应用采集参数（宽/高/格式/帧率/图案）。统一走寄存器写入路径：
-    /// onWrite 钩子同步 Config 并自动刷新 PayloadSize（0x0D18 / 0x140018），
+    /// onWrite 钩子同步 Config 并自动刷新 PayloadSize（0x140018），
     /// 保证 GenICam 寄存器、Config 与 GVSP 实际出帧三者一致（直接改 Config 不会更新寄存器表）。
     /// </summary>
     /// <param name="width">宽度（自动夹为偶数；16..8192）。</param>
