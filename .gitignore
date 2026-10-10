@@ -1,0 +1,17 @@
+# ---------- IDE 缓存与目录 ----------
+.vs/
+.idea/
+packages
+.workbuddy
+
+# ---------- 编译产物（bin / obj） ----------
+[Bb]in/
+[Oo]bj/
+[Dd]ebug/
+[Dd]ebugPublic/
+[Rr]elease/
+[Rr]eleases/
+x64/
+x86/
+bld/
+[Bb]uild/
