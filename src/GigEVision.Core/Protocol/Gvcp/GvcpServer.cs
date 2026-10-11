@@ -41,6 +41,16 @@ public sealed class GvcpServer : IDisposable
     /// <summary>ReadMem 单次读取字节数上限（Aravis 客户端按 ≤512 字节分块拉取，对齐 ARV_GVCP_DATA_SIZE_MAX）。</summary>
     public const int MaxReadMemCount = 512;
 
+    /// <summary>
+    /// Discovery 应答负载长度（字节）：引导寄存器区 0x0000-0x00F7 的标准镜像。
+    /// 布局（GigE Vision 2.0 规范，与 Wireshark/Aravis 一致）：
+    /// [0..3] spec_version、[4..7] device_mode、[8..15] MAC（u64 低 48 位，即 MAC 在偏移 10 起）、
+    /// [16..19] supported_ip_cfg（bit0=持久 bit1=DHCP bit2=LLA）、[20..23] current_ip_cfg、
+    /// [36..39] 当前 IP、[52..55] 子网掩码、[68..71] 网关（三者间隔 16 字节），
+    /// [72/104/136/168/216/232] 名称区（32/32/32/32/16/16）。
+    /// </summary>
+    public const int DiscoveryPayloadSize = 248;
+
     private static readonly byte[] EmptyPayload = Array.Empty<byte>();
 
     private readonly CameraIdentity _identity;
@@ -205,8 +215,8 @@ public sealed class GvcpServer : IDisposable
     }
 
     /// <summary>
-    /// 应用强制 IP 配置（ForceIP）：更新身份信息，并写入持久 IP 寄存器（0x0640/44/48）
-    /// 与当前 IP 寄存器（0x06C8/CC/D0）。
+    /// 应用强制 IP 配置（ForceIP）：更新身份信息，并写入持久 IP 寄存器（0x064C/65C/66C）
+    /// 与当前 IP 寄存器（0x0024/34/44，Discovery 负载直接镜像这三个寄存器）。
     /// </summary>
     public void ApplyNetworkConfig(IPAddress ip, IPAddress subnet, IPAddress gateway)
     {
@@ -296,10 +306,12 @@ public sealed class GvcpServer : IDisposable
             switch ((GvcpCommand)header.Command)
             {
                 case GvcpCommand.DiscoveryCmd:
-                    // 单播/广播都回 DiscoveryAck（payload 250B 设备描述）
+                    // 单播/广播都回 DiscoveryAck：负载 = 引导寄存器区前 248 字节的标准镜像。
+                    // 不再单独拼包——身份/IP/名称全部来自寄存器表，与 ReadReg/ReadMem 读到的值天然一致。
+                    var discoveryPayload = new byte[DiscoveryPayloadSize];
+                    _registers.ReadMemory(0, discoveryPayload);
                     SendAck(GvcpHeaderCodec.BuildAck(
-                        GvcpCommand.DiscoveryAck, header.ReqId,
-                        _identity.BuildDiscoveryPayload()), from);
+                        GvcpCommand.DiscoveryAck, header.ReqId, discoveryPayload), from);
                     break;
 
                 case GvcpCommand.ForceIpCmd:
@@ -339,16 +351,36 @@ public sealed class GvcpServer : IDisposable
         }
     }
 
-    /// <summary>ForceIP：payload = 保留(2) + MAC(6) + IP(4) + 子网(4) + 网关(4)，全大端。MAC 匹配才应用。</summary>
+    /// <summary>
+    /// ForceIP：标准载荷 56 字节，MAC 在偏移 2、IP 在 20、子网在 36、网关在 52（GigE Vision 规范，
+    /// 与 Wireshark dissector 一致）。兼容 20 字节紧凑变体（MAC@0、IP@8、子网@12、网关@16）。
+    /// MAC 匹配才应用并回 ACK；不匹配回 InvalidHeader（客户端拿到的 MAC 来自 Discovery 负载，
+    /// 因此 Discovery 寄存器镜像正确后本路径不应再被触发）。
+    /// </summary>
     private void HandleForceIp(GvcpHeader header, ReadOnlySpan<byte> payload, IPEndPoint from)
     {
-        if (payload.Length < 20)
+        int macOffset, ipOffset, maskOffset, gatewayOffset;
+        if (payload.Length >= 56)
+        {
+            macOffset = 2;
+            ipOffset = 20;
+            maskOffset = 36;
+            gatewayOffset = 52;
+        }
+        else if (payload.Length >= 20)
+        {
+            macOffset = 0;
+            ipOffset = 8;
+            maskOffset = 12;
+            gatewayOffset = 16;
+        }
+        else
         {
             SendError(GvcpCommand.ForceIpAck, header.ReqId, GevStatus.InvalidHeader, from);
             return;
         }
 
-        var mac = payload.Slice(2, 6);
+        var mac = payload.Slice(macOffset, 6);
         var identityMac = _identity.MacAddress;
         if (identityMac is not { Length: 6 } || !mac.SequenceEqual(identityMac))
         {
@@ -357,9 +389,9 @@ public sealed class GvcpServer : IDisposable
             return;
         }
 
-        var ip = new IPAddress(payload.Slice(8, 4));
-        var subnet = new IPAddress(payload.Slice(12, 4));
-        var gateway = new IPAddress(payload.Slice(16, 4));
+        var ip = new IPAddress(payload.Slice(ipOffset, 4));
+        var subnet = new IPAddress(payload.Slice(maskOffset, 4));
+        var gateway = new IPAddress(payload.Slice(gatewayOffset, 4));
         ApplyNetworkConfig(ip, subnet, gateway);
         SendAck(GvcpHeaderCodec.BuildAck(GvcpCommand.ForceIpAck, header.ReqId, EmptyPayload), from);
     }

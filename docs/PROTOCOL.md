@@ -5,7 +5,8 @@
 
 - 所有字节序：**大端（Big-Endian）**，手工位移编解码；
 - GVCP 控制通道固定 **UDP 3956**（绑定 `0.0.0.0`，`ReuseAddress`）；
-- GVSP 流通道源端口由系统分配（绑定 `BindAddress`，port=0），实际端口写入 0x0D1C（GevSCSP）供客户端回读；
+- GVSP 流通道源端口由系统分配（绑定 `BindAddress`，port=0），实际端口写入 0x0D14（GevSCPHostPort）供客户端回读；
+- 流目的地 = 客户端写 0x0D18（GevSCDA）+ 0x0D1C（GevSCSP），任一为 0 时回退当前控制者 IP/端口；
 - 引导寄存器布局与 **Aravis 0.8.x / pylon 等客户端的硬编码布局一致**（见第 7 节兼容性要点）。
 
 ---
@@ -13,7 +14,7 @@
 ## 1. 寄存器总表
 
 寄存器宽度均为 4 字节（u32，大端）；标注「内存区」的地址须用 ReadMem/WriteMem 访问。
-「RO」= 客户端写入回 `WriteProtect(0x800C)`。
+「RO」= 客户端写入回 `WriteProtect(0x8004)`。
 
 | 地址 | 名称 | 读写 | 含义 |
 |------|------|------|------|
@@ -48,13 +49,19 @@
 | `0x00000948` | TimestampLatchHigh | RO | 锁存时间戳高 32 位 |
 | `0x0000094C` | TimestampLatchLow | RO | 锁存时间戳低 32 位 |
 | `0x00000A00` | ControlPrivilege | RW | 控制权：写 0 释放；非 0 申请控制（仲裁见第 5 节，占用时回 `AccessDenied`） |
-| `0x00000D00` | Sc0Port | RW | 流通道 0：GVSP 目的端口（低 16 位；GenICam GevSCPHostPort） |
+| `0x00000D00` | Sc0Capability | RO | 流通道 0：能力位图，`0x80000000`（bit31=支持包重发） |
 | `0x00000D04` | Sc0PacketSize | RW | 低 16 位 = GVSP 包大小 + IP/UDP 28B 头（默认 1528 = GVSP 1500 + 28）；bit31=FireTestPacket（自清零）、bit30=DoNotFragment、bit29=BigEndian |
 | `0x00000D08` | Sc0PacketDelay | RW | 流通道 0：包间延迟（微秒，GevSCPD） |
+| `0x00000D0C` | Sc0Control | RW | 流通道 0：bit0=FireTestPacket（自清零，标准地址，与 0x0D04 bit31 同义）、bit1=DoNotFragment、bit2=BigEndian |
+| `0x00000D14` | Sc0SourcePort | RO* | 流通道 0：GVSP 源端口（低 16 位，GevSCPHostPort；*Start() 时回填，客户端写回 WriteProtect） |
 | `0x00000D18` | Sc0DestIp | RW | 流通道 0：GVSP 目的地 IP（GevSCDA）；0 = 回退使用当前控制者 IP |
-| `0x00000D1C` | Sc0SourcePort | RO* | 流通道 0：GVSP 源端口（低 16 位，GevSCSP；*Start() 时回填） |
+| `0x00000D1C` | Sc0DestPort | RW | 流通道 0：GVSP 目的端口（GevSCSP，客户端写入其收流端口）；0 = 回退使用当前控制者端口 |
+| `0x00000D20` | Sc0BigEndianess | RW | 流通道 0：GV2=大端能力 / GV1.2=时间戳控制；小端设备回 0，可写仅存储（**VisionMaster 打开相机必读**） |
+| `0x00000D24` | Sc0TimestampFreq | RO | 流通道 0：时间戳计数频率 `0x3B9ACA00`（1e9 Hz，与 0x0940 一致） |
+| `0x00000D28` | Sc0TimestampHigh | RO | 流通道 0：时间戳计数高 32 位（锁存值） |
+| `0x00000D2C` | Sc0TimestampLow | RO | 流通道 0：时间戳计数低 32 位（锁存值） |
 | `0x00100000` | XmlBlobBase | RO | GenICam XML 内存区（256KB 上限），GenICam local 模式经 0x0200 URL 寻址 |
-| `0x00140000` | Width | RW | 图像宽度（16..8192 且偶数，非法回 `InvalidParameter(0x8015)`） |
+| `0x00140000` | Width | RW | 图像宽度（16..8192 且偶数，非法回 `InvalidParameter(0x8002)`） |
 | `0x00140004` | Height | RW | 图像高度（16..8192） |
 | `0x00140008` | PixelFormat | RW | 像素格式（PFNC 码，见第 4 节，仅支持 4 种） |
 | `0x0014000C` | AcquisitionStart | W | 命令寄存器：写 1 启动采集 |
@@ -102,18 +109,19 @@ public enum GvcpCommand : ushort {
     WriteMemCmd = 0x0086, WriteMemAck = 0x0087,
 }
 public enum GevStatus : ushort {
-    Success = 0x0000, NotImplemented = 0x8001, Error = 0x8002, AccessDenied = 0x8003,
-    PortInUse = 0x8006, InvalidHeader = 0x8009, InvalidAddress = 0x800B,
-    WriteProtect = 0x800C, BadAlignment = 0x800D, NotAvailable = 0x8013, InvalidParameter = 0x8015,
+    Success = 0x0000, NotImplemented = 0x8001, InvalidParameter = 0x8002, InvalidAddress = 0x8003,
+    WriteProtect = 0x8004, BadAlignment = 0x8005, AccessDenied = 0x8006, Busy = 0x8007,
+    PacketUnavailable = 0x800C, DataOverrun = 0x800D, InvalidHeader = 0x800E, Overflow = 0x8015, Error = 0x8FFF,
 }
 ```
+（状态码数值对齐 GigE Vision 规范，与 Wireshark GVCP dissector / Aravis ArvGvcpStatus 一致，勿自造。）
 
 各命令语义与载荷（与 Aravis 0.8.x `arvgvcp.c` 线格式逐字段一致）：
 
 | 命令 | 请求载荷 | ACK 载荷 | 说明 |
 |------|----------|----------|------|
-| `0x0002` Discovery | 无 | 250B 设备描述（第 3 节） | 单播/广播一律应答 |
-| `0x0004` ForceIP | `[0..1]` 保留、`[2..7]` MAC(6B)、`[8..11]` IP、`[12..15]` 子网、`[16..19]` 网关 | 无（status-only） | MAC 匹配则应用（写 identity + 0x64C/65C/66C 与 0x24/34/44）并回 Success；不匹配回 `InvalidHeader` |
+| `0x0002` Discovery | 无 | 248B 设备描述（第 3 节）= 引导寄存器区 0x0000-0x00F7 镜像 | 单播/广播一律应答 |
+| `0x0004` ForceIP | 56B：`[2..7]` MAC、`[20..23]` IP、`[36..39]` 子网、`[52..55]` 网关（其余保留 0）；兼容 20B 紧凑变体（MAC@0/IP@8/子网@12/网关@16） | 无（status-only） | MAC 匹配则应用（写 identity + 0x64C/65C/66C 与 0x24/34/44）并回 Success；不匹配回 `InvalidHeader` |
 | `0x0080` ReadReg | N × u32 地址 | N × u32 值 | 依地址顺序读取；首个失败则整包回该错误状态 |
 | `0x0082` WriteReg | 地址/值对 × N | `index(u32)` = 成功写入个数 | 逐对写入；任一失败回该错误状态（Aravis 校验 ACK 总长 ≥ 包头+4） |
 | `0x0084` ReadMem | `addr(u32) + count(u32)`（count 按 4 对齐向上取整） | `addr(u32)` 回显 + 数据 | count 上限 512（Aravis 分块拉取），再向下 4 字节对齐 |
@@ -121,63 +129,67 @@ public enum GevStatus : ushort {
 | `0x0040` Resend | `block_id(u32) + first(u32) + last(u32)`（低 24 位有效） | —（转 GVSP 重发） | 到达 GVCP 端口的情形；`last=0xFFFF/0xFFFFFFFF` 表示「直到结尾」，见第 4 节 |
 | 未知命令 | — | ERROR（ack=cmd+1，`NotImplemented(0x8001)`） | — |
 
-ReadReg/ReadMem 地址未定义（ReadReg 路径）→ `InvalidAddress(0x800B)`；非 4 字节对齐 → `BadAlignment(0x800D)`；
-RO 地址写 → `WriteProtect(0x800C)`。
+ReadReg/ReadMem 地址未定义（ReadReg 路径）→ `InvalidAddress(0x8003)`；非 4 字节对齐 → `BadAlignment(0x8005)`；
+RO 地址写 → `WriteProtect(0x8004)`。
 
 ---
 
-## 3. DiscoveryAck 载荷（250 字节，全部大端）
+## 3. DiscoveryAck 载荷（248 字节，全部大端）
+
+负载 = 引导寄存器区 0x0000-0x00F7 的标准镜像（GigE Vision 2.0 发现结构，与 Wireshark
+`dissect_discovery_ack` / Aravis 逐字段一致；不单独拼包，直接由寄存器表生成，
+与 ReadReg/ReadMem 读到的值天然一致）：
 
 ```
-[0]     spec_major = 1
-[1]     spec_minor = 2
-[2..3]   MAC 高 16 位
-[4..7]   MAC 低 32 位
-[8..11]  当前 IP
-[12..15] 当前子网
-[16..19] 当前网关
-[20..21] ip_options = 0
-[22..53]  ManufacturerName   (32B, ASCII, 0 结尾 0 填充)
-[54..85]  ModelName          (32B)
-[86..117] DeviceVersion     (32B)
-[118..165]ManufacturerInfo  (48B)
-[166..181]SerialNumber      (16B)
-[182..245]UserDefinedName   (64B)
-[246]    ip_config_options = 0x05  (Persistent | LLA capable)
-[247]    ip_config_current = 0x01  (Persistent 生效)
-[248]    reserved = 0
-[249]    reserved = 0
+[0..3]   spec_version (u32: major<<16|minor，本设备 0x00010002 = GV 1.2)
+[4..7]   device_mode (u32；bit31=1 大端设备)
+[8..15]  MAC（u64 低 48 位，即 MAC 6 字节位于偏移 10..15；对应寄存器 0x0008/0x000C）
+[16..19] supported_ip_configuration（bit0=Persistent bit1=DHCP bit2=LLA，本设备 0x05）
+[20..23] current_ip_configuration（本设备 0x01 = Persistent 生效）
+[36..39] 当前 IP        （寄存器 0x0024）
+[52..55] 当前子网掩码    （寄存器 0x0034；与 IP 间隔 16 字节）
+[68..71] 当前网关       （寄存器 0x0044）
+[72..103]  ManufacturerName (32B ASCII)
+[104..135] ModelName        (32B)
+[136..167] DeviceVersion    (32B)
+[168..199] ManufacturerInfo (32B)
+[216..231] SerialNumber     (16B)
+[232..247] UserDefinedName  (16B)
 ```
 
-ASCII 名称区编码规则：超长截断（保留末位 0 结尾）、剩余 0 填充、非可打印字符替换为 `?`。
+⚠ 此前版本曾按自造 250B 布局（MAC@2/IP@8/名称@22 起）发送，VisionMaster 等标准客户端按
+本表偏移解析会得到 MAC=全 0、IP=0.0.0.0、子网读到字符串碎片——这正是「相机感叹号、
+提示修改 IP、ForceIP 报 MAC 不匹配」的根因。
 
 ---
 
 ## 4. GVSP 流通道（UDP，源端口自选）
 
-包头 8 字节（大端）：
+包头 8 字节（大端；**无魔数字节**，与 Wireshark GVSP dissector / Aravis arvgvsp 逐字段一致）：
 
 ```
-[0]      = 0x37            GVSP key
-[1]      = flags = 0
-[2..3]   = format          Leader=0x0001 / Trailer=0x0002 / Data=0x0003
-[4..5]   = packet_id       Leader=0，Data=1..N，Trailer=N+1
-[6..7]   = block_id        帧号，从 1 自增，65535 后回 1
+[0..1]   = status (u16)    0x0000 = 成功（本设备恒发成功帧）
+[2..3]   = block_id        帧号，从 1 自增，65535 后回 1
+[4]      = content_type    Leader=0x01 / Trailer=0x02 / Data=0x03（bit7 = 扩展 ID 标志，本设备不用）
+[5..7]   = packet_id (24 位) Leader=0，Data=1..N，Trailer=N+1
 ```
 
-### Leader（包头 8B + 载荷 34B）
+⚠ 此前版本曾按自造布局（[0]=0x37 魔数、[2..3]=format、[4..5]=packet_id、[6..7]=block_id）发送，
+标准客户端无法识别。
+
+### Leader（包头 8B + 载荷 36B）
 
 ```
-[0..1]   保留 = 0
+[0..1]   flags = 0
 [2..3]   payload_type = 1 (image)
-[4..9]   timestamp (u48, ns)
-[10..13] pixel_format (PFNC)
-[14..17] size_x
-[18..21] size_y
-[22..25] offset_x = 0
-[26..29] offset_y = 0
-[30..31] padding_x = 0
-[32..33] padding_y = 0
+[4..11]  timestamp (u64, ns，高 32 位在前)
+[12..15] pixel_format (PFNC)
+[16..19] size_x
+[20..23] size_y
+[24..27] offset_x = 0
+[28..31] offset_y = 0
+[32..33] padding_x = 0
+[34..35] padding_y = 0
 ```
 
 ### Data（包头 8B + 像素分片）
@@ -188,14 +200,13 @@ ASCII 名称区编码规则：超长截断（保留末位 0 结尾）、剩余 0
 0x0D04 低 16 位（GenICam GevSCPSPacketSize）= UDP 载荷字节数 + 28（IP 20 + UDP 8）
 GVSP 包字节数 = 0x0D04 低 16 位 − 28
 每片像素数据   = 0x0D04 低 16 位 − 36
-默认 1528 → GVSP 包 1500B → 每片 1472B
+默认 0x0D04=1528 → GVSP 包 1500B → 每片 1492B
 ```
 
 ### Trailer（包头 8B + 载荷 8B）
 
 ```
-[0..1]   保留 = 0
-[2..3]   payload_type = 1
+[0..3]   payload_type = 1 (u32)
 [4..7]   size_y
 ```
 
@@ -214,8 +225,8 @@ GVSP 包字节数 = 0x0D04 低 16 位 − 28
 - 客户端对丢包重发 `ResendCmd(0x0040)`：`first..last` 区间内的包按原包头格式重发（`last=0xFFFF` 重发到帧尾），
   `packet_id` 与缓存下标一致（0=Leader，N+1=Trailer）；
 - 到达 GVCP 端口的重发请求在 GvcpServer 解析后回调 `OnResendRequest`，转交 `GvspTransmitter.HandleResend`；
-- `0x0D04` bit31（GevSCPSFireTestPacket）写入 1 → 设备按当前包大小向流目的地发送一个 GVSP 测试数据包
-  （自清零位），供 Aravis `auto_packet_size` 探测路径 MTU；
+- `0x0D04` bit31 与 `0x0D0C` bit0（GevSCPSFireTestPacket 标准地址）写入 1 → 设备按当前包大小向流目的地发送一个
+  GVSP 测试数据包（自清零位），供 Aravis `auto_packet_size` 探测路径 MTU；
 - 统计：`StreamStats.ResendRequests`（请求数）与 `ResendPackets`（实发重发包数）。
 
 ---
@@ -230,7 +241,7 @@ GVSP 包字节数 = 0x0D04 低 16 位 − 28
    |<-- WriteRegAck(status=0) -----------|   记录控制者 EP，心跳启动       |
    |                                     |                               |
    |--- WriteReg 0x0D18 = clientIP ----->|  流目的地 = 0x0D18 或控制者 IP  |
-   |--- WriteReg 0x0D00 = clientPort --->|  （低 16 位）                  |
+   |--- WriteReg 0x0D1C = clientPort --->|  （GevSCSP，0 回退控制者端口）   |
    |--- WriteReg 0x0D04 = size|bit31 --->|  夹紧回写 + FireTestPacket     |
    |--- WriteReg 0x00140000/04 = W/H --->|  语义校验 + 刷新 PayloadSize   |
    |--- WriteReg 0x0014000C = 1 -------->|------------------------------>| StartAcquisition
@@ -248,10 +259,10 @@ GVSP 包字节数 = 0x0D04 低 16 位 − 28
 规则摘要：
 
 - 写 `0x0A00`：`value==0` 释放控制；非 0 且当前无控制器**或来自同一 IP** → 获得控制（记录控制者 EP + 心跳开始）；
-  其他 IP 已占用 → ACK `AccessDenied(0x8003)`；
+  其他 IP 已占用 → ACK `AccessDenied(0x8006)`；
 - **任何**来自当前控制者的 GVCP 请求都刷新心跳计时；0x0938 写入即时生效（下限 500ms）；
 - 心跳超时 → 自动释放控制权并停止采集（GVSP 停发）；
-- 流目的地：0x0D18 非 0 用之，否则用当前控制者 IP；端口 = 0x0D00 低 16 位；两者都无 → 跳过发送（仅统计帧）。
+- 流目的地：0x0D18 非 0 用之，否则用当前控制者 IP；端口 = 0x0D1C 低 16 位，0 回退当前控制者端口；两者都无 → 跳过发送（仅统计帧）。
 
 ---
 
@@ -259,7 +270,7 @@ GVSP 包字节数 = 0x0D04 低 16 位 − 28
 
 已实现：
 
-- GVCP：Discovery（单播/广播恒答 250B）、Force IP、ReadReg/WriteReg/ReadMem/WriteMem、Resend 转发、
+- GVCP：Discovery（单播/广播恒答 248B 引导区镜像）、Force IP、ReadReg/WriteReg/ReadMem/WriteMem、Resend 转发、
   控制权仲裁（0x0A00）、心跳（0x0938）、未知命令 NotImplemented（ERROR 应答）；
 - 标准引导区：版本/设备模式/MAC/IP 配置/名称区/XML URL×2/接口与通道计数/GVCP 能力位图/时间戳寄存器；
 - GVSP：Leader/Data/Trailer（经典模式单流通道）、block_id 回绕、包重发（缓存 4 帧）、
@@ -295,8 +306,16 @@ GVSP 包字节数 = 0x0D04 低 16 位 − 28
 4. **ReadMem 线格式**：请求 `addr(u32)+count(u32)`；应答 `addr(u32) 回显 + 数据`——数据紧跟 4 字节地址，
    没有独立的 2 字节 index 字段。
 5. **0x0D04（SCPS）位布局**：包大小在低 16 位，FireTestPacket=bit31、DoNotFragment=bit30、BigEndian=bit29。
-   GenApi XML 中用 `<Bit>0</Bit>` 表示 bit31、`<LSB>31</LSB><MSB>16</MSB>` 表示低 16 位
-   （BigEndian 寄存器的位序按 GenApi 标准从最高位起编号）。
+   标准测试包地址 0x0D0C bit0 与之同义，两处都响应；GenApi XML 中用 `<Bit>0</Bit>` 表示寄存器最高位
+   （bit31）、`<LSB>31</LSB><MSB>16</MSB>` 表示低 16 位（BigEndian 寄存器的位序按 GenApi 标准从最高位起编号）。
 6. **心跳**：Aravis 心跳线程周期性读 0x0A00（不写 0x938），每次读取都会刷新本设备的心跳计时。
-7. **引导区地址不可挪动**：0x934/0x938/0x900/0x904/0x93C/0x940/0xD00/0xD04/0xD08/0xD18/0xD1C 等为
-   客户端硬编码或注入默认特性所引用的标准地址；设备自定义特性一律放 0x140000+。
+7. **引导区地址不可挪动**：0x934/0x938/0x900/0x904/0x93C/0x940/0xD00/0xD04/0xD08/0xD0C/0xD14/0xD18/0xD1C/0xD20
+   等为客户端硬编码或注入默认特性所引用的标准地址；设备自定义特性一律放 0x140000+。
+8. **流通道 0 标准块必须完整**：VisionMaster 打开相机时按 GigE Vision 标准布局顺序访问 0x0D00–0x0D2C
+   （能力/包大小/延迟/测试包/源端口/目的 IP/目的端口/0x0D20…），任一地址回 `InvalidAddress`
+   客户端立即断开（表现为「控制端已接入 → ReadReg 0x0D20 失败 → 控制端已断开」）。
+   源端口在 0x0D14（GevSCPHostPort，RO）、目的端口在 0x0D1C（GevSCSP，客户端写入）——
+   二者不可颠倒，否则客户端写收流端口回 WriteProtect 同样断开。
+9. **引导区宽容模式（RegisterMap lenientBootstrap）**：0x00000000–0x000FFFFF 内未定义地址
+   ReadReg/ReadMem 回 0、WriteReg/WriteMem 静默忽略（均 ACK 成功），客户端探测标准保留寄存器
+   （如 0x0A04/0x0240）不再触发断线；GenICam 设备区（≥0x00100000）仍严格报错以暴露特征地址配置错误。

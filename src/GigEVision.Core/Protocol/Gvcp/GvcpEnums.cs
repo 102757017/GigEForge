@@ -8,7 +8,7 @@ public enum GvcpCommand : ushort
     /// <summary>发现命令（允许单播或广播，设备端都必须应答）。</summary>
     DiscoveryCmd = 0x0002,
 
-    /// <summary>发现应答（payload 为 250 字节设备描述，见契约 5.2）。</summary>
+    /// <summary>发现应答（payload 为 248 字节标准设备描述 = 引导寄存器区 0x0000-0x00F7 镜像）。</summary>
     DiscoveryAck = 0x0003,
 
     /// <summary>强制 IP 命令（payload 含 MAC + IP/子网/网关）。</summary>
@@ -51,7 +51,10 @@ public enum GvcpCommand : ushort
     WriteMemAck = 0x0087,
 }
 
-/// <summary>GVCP 全局状态码（应答包 status 字段，即包头前两字节：成功 0x0000，错误 0x8xxx）。</summary>
+/// <summary>
+/// GVCP 全局状态码（应答包头 status 字段，即包头前两字节：成功 0x0000，错误 0x8xxx）。
+/// 数值对齐 GigE Vision 规范（与 Wireshark GVCP dissector / Aravis ArvGvcpStatus 一致，勿自造）。
+/// </summary>
 public enum GevStatus : ushort
 {
     /// <summary>成功。</summary>
@@ -60,32 +63,38 @@ public enum GevStatus : ushort
     /// <summary>命令未实现（未知命令）。</summary>
     NotImplemented = 0x8001,
 
-    /// <summary>通用错误。</summary>
-    Error = 0x8002,
-
-    /// <summary>访问被拒绝（控制权被他方占用）。</summary>
-    AccessDenied = 0x8003,
-
-    /// <summary>端口被占用。</summary>
-    PortInUse = 0x8006,
-
-    /// <summary>包头非法（如 ForceIP 的 MAC 不匹配）。</summary>
-    InvalidHeader = 0x8009,
+    /// <summary>参数非法（如宽高超限、像素格式不支持、载荷长度错误）。</summary>
+    InvalidParameter = 0x8002,
 
     /// <summary>地址未定义。</summary>
-    InvalidAddress = 0x800B,
+    InvalidAddress = 0x8003,
 
     /// <summary>写保护（只读寄存器/内存区被写）。</summary>
-    WriteProtect = 0x800C,
+    WriteProtect = 0x8004,
 
     /// <summary>对齐错误（内存区访问未 4 字节对齐）。</summary>
-    BadAlignment = 0x800D,
+    BadAlignment = 0x8005,
 
-    /// <summary>功能当前不可用。</summary>
-    NotAvailable = 0x8013,
+    /// <summary>访问被拒绝（控制权被他方占用）。</summary>
+    AccessDenied = 0x8006,
 
-    /// <summary>参数非法（如宽高超限、像素格式不支持）。</summary>
-    InvalidParameter = 0x8015,
+    /// <summary>设备忙（端口/资源被占用）。</summary>
+    Busy = 0x8007,
+
+    /// <summary>请求的数据包不可用（重发窗口外）。</summary>
+    PacketUnavailable = 0x800C,
+
+    /// <summary>数据溢出。</summary>
+    DataOverrun = 0x800D,
+
+    /// <summary>包头非法（如 ForceIP 的 MAC 不匹配、载荷长度错误）。</summary>
+    InvalidHeader = 0x800E,
+
+    /// <summary>溢出。</summary>
+    Overflow = 0x8015,
+
+    /// <summary>通用错误。</summary>
+    Error = 0x8FFF,
 }
 
 /// <summary>GVCP 包头 flags 字段（1 字节）。</summary>

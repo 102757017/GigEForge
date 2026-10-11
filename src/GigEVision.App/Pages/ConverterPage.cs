@@ -3,6 +3,10 @@ using System.Runtime.InteropServices;
 using System.Windows.Forms;
 using GigEVision.Core.Imaging;
 using OpenCvSharp;
+// 消除 System.Drawing 与 OpenCvSharp 之间的 Size/Point 二义性（本页 WinForms 用法为主，
+// OpenCV 侧已在应用点全限定为 OpenCvSharp.Size）
+using Size = System.Drawing.Size;
+using Point = System.Drawing.Point;
 
 namespace GigEVision.App.Pages;
 
@@ -419,8 +423,8 @@ public class ConverterPage : UserControl
         w = Math.Clamp(w, 1, availWidth);
         h = Math.Clamp(h, 1, availHeight);
 
-        _preview.Size = new System.Drawing.Size(w, h);
-        _preview.Location = new System.Drawing.Point(
+        _preview.Size = new Size(w, h);
+        _preview.Location = new Point(
             _previewHost.Padding.Left + (availWidth - w) / 2,
             _previewHost.Padding.Top + (availHeight - h) / 2);
 

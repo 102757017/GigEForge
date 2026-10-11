@@ -27,6 +27,7 @@ public sealed class HeartbeatMonitor : IDisposable
     {
         _timeout = initialTimeout < TimeSpan.Zero ? TimeSpan.Zero : initialTimeout;
         _timer = new Timer(OnTick, null, System.Threading.Timeout.InfiniteTimeSpan, System.Threading.Timeout.InfiniteTimeSpan);
+        // 注意：不能用简写 Timeout.InfiniteTimeSpan——会被解析为本类的 Timeout 属性（TimeSpan）而报 CS1061
     }
 
     /// <summary>心跳超时时间。</summary>

@@ -65,9 +65,9 @@ public static class GenICamXml
         StringReg(sb, "DeviceModelName", 0x00000068, 32);
         StringReg(sb, "DeviceVersion", 0x00000088, 32);
         StringReg(sb, "DeviceFirmwareVersion", 0x00000088, 32);      // 与 DeviceVersion 同区（别名）
-        StringReg(sb, "DeviceManufacturerInfo", 0x000000A8, 48);
+        StringReg(sb, "DeviceManufacturerInfo", 0x000000A8, 32);
         StringReg(sb, "DeviceID", 0x000000D8, 16);
-        StringReg(sb, "DeviceUserID", 0x000000E8, 64);
+        StringReg(sb, "DeviceUserID", 0x000000E8, 16);
 
         // ============ ImageFormatControl ============
         Category(sb, "ImageFormatControl", "Width", "Height", "PixelFormat", "PayloadSize", "TestPattern");
@@ -106,30 +106,30 @@ public static class GenICamXml
         sb.Append("    <Min>0</Min>\n");
         sb.Append("    <Max>1</Max>\n");
         sb.Append("  </Integer>\n");
-        // GevSCPHostPort：GVSP 目的端口（0x0D00 低 16 位）
+        // GevSCPHostPort：相机流通道源端口（0x0D14 低 16 位，RO，设备自维护回填）
         Integer(sb, "GevSCPHostPort", null, null, null, "GevSCPHostPortReg", locked: true);
-        MaskedIntReg(sb, "GevSCPHostPortReg", 0x00000D00, "RW", lsb: 31, msb: 16);
+        MaskedIntReg(sb, "GevSCPHostPortReg", 0x00000D14, "RO", lsb: 31, msb: 16);
         // GevSCPSPacketSize：GVSP 包大小（0x0D04 低 16 位，含 IP/UDP 28B 头；设备侧会夹紧并回写）
         Integer(sb, "GevSCPSPacketSize", 604, 16028, 4, "GevSCPSPacketSizeReg", locked: true);
         MaskedIntReg(sb, "GevSCPSPacketSizeReg", 0x00000D04, "RW", lsb: 31, msb: 16);
-        // GevSCPSFireTestPacket：命令（写 0x0D04 bit31，设备回发测试包供路径 MTU 探测，自清零）
+        // GevSCPSFireTestPacket：命令（0x0D0C bit0 标准地址，写 1 回发测试包供路径 MTU 探测，自清零）
         Command(sb, "GevSCPSFireTestPacket", "GevSCPSFireTestPacketReg", locked: true);
-        MaskedIntReg(sb, "GevSCPSFireTestPacketReg", 0x00000D04, "RW", bit: 0);
-        // GevSCPSDoNotFragment：布尔（0x0D04 bit30，本设备不分片，仅保留位状态）
+        MaskedIntReg(sb, "GevSCPSFireTestPacketReg", 0x00000D0C, "RW", bit: 31);
+        // GevSCPSDoNotFragment：布尔（0x0D0C bit1，本设备不分片，仅保留位状态）
         sb.Append("  <Boolean Name=\"GevSCPSDoNotFragment\" NameSpace=\"Standard\">\n");
         sb.Append("    <pIsLocked>TLParamsLocked</pIsLocked>\n");
         sb.Append("    <pValue>GevSCPSDoNotFragmentReg</pValue>\n");
         sb.Append("  </Boolean>\n");
-        MaskedIntReg(sb, "GevSCPSDoNotFragmentReg", 0x00000D04, "RW", bit: 1);
+        MaskedIntReg(sb, "GevSCPSDoNotFragmentReg", 0x00000D0C, "RW", bit: 30);
         // GevSCPD：包间延迟（微秒，0x0D08 全 32 位）
         Integer(sb, "GevSCPD", null, null, null, "GevSCPDReg", locked: true);
         IntReg(sb, "GevSCPDReg", 0x00000D08, "RW");
         // GevSCDA：GVSP 目的地 IP（0x0D18 全 32 位大端；0 = 使用控制者 IP）
         Integer(sb, "GevSCDA", null, null, null, "GevSCDAReg", locked: true);
         IntReg(sb, "GevSCDAReg", 0x00000D18, "RW");
-        // GevSCSP：GVSP 源端口（0x0D1C 低 16 位，RO）
+        // GevSCSP：GVSP 目的端口 = 客户端收流端口（0x0D1C 低 16 位，RW，客户端写入）
         Integer(sb, "GevSCSP", null, null, null, "GevSCSPReg", locked: true);
-        MaskedIntReg(sb, "GevSCSPReg", 0x00000D1C, "RO", lsb: 31, msb: 16);
+        MaskedIntReg(sb, "GevSCSPReg", 0x00000D1C, "RW", lsb: 31, msb: 16);
 
         // ============ 设备端口（所有寄存器节点的 pPort 目标，缺失会导致 "Port not found for node"） ============
         sb.Append("  <Port Name=\"Device\" NameSpace=\"Standard\">\n");

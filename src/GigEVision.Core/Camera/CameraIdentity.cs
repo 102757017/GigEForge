@@ -4,7 +4,9 @@ using System.Net;
 namespace GigEVision.Core.Camera;
 
 /// <summary>
-/// 相机身份：GigE Vision Discovery 报文（契约 5.2）与 GenICam XML（第 8 节）的身份注入源。
+/// 相机身份：GenICam XML（契约第 8 节）与引导寄存器区初始化的身份注入源。
+/// 注意：GVCP Discovery 应答负载不在此构建——它直接镜像寄存器表前 248 字节（引导区标准布局），
+/// 由 VirtualCamera 把本身份写入寄存器后自动生效（避免两处维护导致线格式漂移）。
 /// </summary>
 public sealed class CameraIdentity
 {
@@ -17,13 +19,13 @@ public sealed class CameraIdentity
     /// <summary>设备版本（32B）。</summary>
     public string DeviceVersion { get; set; } = "1.0.0";
 
-    /// <summary>厂商附加信息（48B）。</summary>
+    /// <summary>厂商附加信息（32B）。</summary>
     public string ManufacturerInfo { get; set; } = "GigE Vision Virtual Camera Suite";
 
     /// <summary>序列号（16B，同时充当 GenICam DeviceID）。</summary>
     public string SerialNumber { get; set; } = "GF-0000001";
 
-    /// <summary>用户自定义名（64B，客户端搜索/显示用）。</summary>
+    /// <summary>用户自定义名（16B，客户端搜索/显示用）。</summary>
     public string UserDefinedName { get; set; } = "GigEForgeCam";
 
     /// <summary>MAC 地址（6 字节；02 前缀 = 本地管理位，虚拟网卡惯用）。</summary>
@@ -48,43 +50,6 @@ public sealed class CameraIdentity
         }
     }
 
-    /// <summary>
-    /// 构建 250 字节 DiscoveryAck 负载（契约 5.2，全部大端）：
-    /// [0..1] spec 1.2；[2..3] MAC 高 16 位；[4..7] MAC 低 32 位；[8..19] IP/子网/网关；
-    /// [20..21] ip_options=0；[22..245] 五段 ASCII 名称区；[246]=0x05；[247]=0x01；[248..249]=0。
-    /// </summary>
-    public byte[] BuildDiscoveryPayload()
-    {
-        var p = new byte[250];
-        p[0] = 0x01; // spec_major = 1
-        p[1] = 0x02; // spec_minor = 2
-
-        var mac = NormalizeMac();
-        p[2] = mac[0];                                              // MAC 高 16 位（大端拆分）
-        p[3] = mac[1];
-        p[4] = mac[2];                                              // MAC 低 32 位
-        p[5] = mac[3];
-        p[6] = mac[4];
-        p[7] = mac[5];
-
-        WriteIp(p, 8, CurrentIp);          // 当前 IP（网络序 = 大端）
-        WriteIp(p, 12, CurrentSubnetMask); // 当前子网
-        WriteIp(p, 16, CurrentGateway);    // 当前网关
-        // [20..21] ip_options = 0（保持零）
-
-        WriteAscii(p, 22, 32, ManufacturerName);   // ManufacturerName
-        WriteAscii(p, 54, 32, ModelName);          // ModelName
-        WriteAscii(p, 86, 32, DeviceVersion);      // DeviceVersion
-        WriteAscii(p, 118, 48, ManufacturerInfo);  // ManufacturerInfo
-        WriteAscii(p, 166, 16, SerialNumber);      // SerialNumber
-        WriteAscii(p, 182, 64, UserDefinedName);   // UserDefinedName
-
-        p[246] = 0x05; // ip_config_options：LLA | Persistent 可配置
-        p[247] = 0x01; // ip_config_current：LLA 生效
-        // [248..249] 保留 = 0
-        return p;
-    }
-
     /// <summary>MAC 规范化：不足 6 字节补 0，超出截断。</summary>
     private byte[] NormalizeMac()
     {
@@ -94,31 +59,4 @@ public sealed class CameraIdentity
         return mac;
     }
 
-    /// <summary>写 IPv4 大端 4 字节（非 IPv4 地址按 0.0.0.0 处理）。</summary>
-    private static void WriteIp(byte[] buf, int off, IPAddress? ip)
-    {
-        byte[] b = ip != null && ip.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork
-            ? ip.GetAddressBytes() // GetAddressBytes 本身即网络序（大端）
-            : new byte[4];
-        buf[off] = b[0];
-        buf[off + 1] = b[1];
-        buf[off + 2] = b[2];
-        buf[off + 3] = b[3];
-    }
-
-    /// <summary>
-    /// 写 ASCII 名称区：超长截断（保留末位 0 结尾），剩余 0 填充；
-    /// 非 ASCII 可打印字符替换为 '?'。
-    /// </summary>
-    private static void WriteAscii(byte[] buf, int off, int size, string? s)
-    {
-        Array.Clear(buf, off, size);
-        if (string.IsNullOrEmpty(s)) return;
-        int n = Math.Min(size - 1, s.Length);
-        for (int i = 0; i < n; i++)
-        {
-            char c = s[i];
-            buf[off + i] = c >= 32 && c <= 126 ? (byte)c : (byte)'?';
-        }
-    }
 }

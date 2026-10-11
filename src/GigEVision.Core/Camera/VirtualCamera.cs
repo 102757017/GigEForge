@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using System.Net;
+using System.Net.NetworkInformation;
 using System.Net.Sockets;
 using System.Text;
 using GigEVision.Core.GenICam;
@@ -84,11 +85,14 @@ public sealed class VirtualCamera : IDisposable, IGvcpCallbacks
     /// <summary>GVSP 包的 IP/UDP 头开销（IP 20 + UDP 8）：0x0D04 寄存器低 16 位 = GVSP 包大小 + 28。</summary>
     private const int UdpOverhead = 28;
 
-    /// <summary>0x0D04 寄存器 bit31：FireTestPacket（自清零）。</summary>
+    /// <summary>0x0D04 寄存器 bit31：FireTestPacket（自清零，与 0x0D0C bit0 同义，兼容新旧客户端）。</summary>
     private const uint ScPsFireTestBit = 0x80000000u;
 
     /// <summary>0x0D04 寄存器回写时保留的标志位掩码（bit30=DoNotFragment、bit29=BigEndian）。</summary>
     private const uint ScPsFlagsKeepMask = 0x60000000u;
+
+    /// <summary>0x0D0C 标准测试包寄存器 bit0：FireTestPacket（自清零，GigE Vision 标准地址）。</summary>
+    private const uint ScControlFireTestBit = 0x00000001u;
 
     /// <summary>采集/喂图线程退出等待上限（毫秒）。</summary>
     private const int ThreadJoinTimeoutMs = 1500;
@@ -98,7 +102,9 @@ public sealed class VirtualCamera : IDisposable, IGvcpCallbacks
 
     private readonly CameraIdentity _identity;
     private readonly CameraConfig _config = new();
-    private readonly RegisterMap _registers = new();
+    // lenientBootstrap：引导区（<0x00100000）未定义地址读 0/写忽略——
+    // VisionMaster/pylon 打开相机会探测标准保留寄存器（0x0D20/0x0A04 等），报错即断开
+    private readonly RegisterMap _registers = new(lenientBootstrap: true);
     private readonly StreamStats _stats = new();
     private readonly GvcpServer _server;
     private readonly GvspTransmitter _transmitter;
@@ -201,9 +207,10 @@ public sealed class VirtualCamera : IDisposable, IGvcpCallbacks
             }
 
             _running = true;
+            ApplyNetworkIdentity();   // Discovery 负载镜像引导寄存器，IP/掩码/网关必须在启动前就位
         }
 
-        // 流源端口回填引导寄存器（GevSCSP，0x0D1C 低 16 位，供客户端回读）
+        // 流源端口回填引导寄存器（GevSCPHostPort，0x0D14 低 16 位，供客户端回读；外部写由回调拦截）
         _registers.WriteRegister(GevRegisters.Sc0SourcePort, (uint)_transmitter.BoundPort);
         Log?.Invoke($"虚拟相机已启动：GVCP UDP {gvcpPort}，流源端口 {_transmitter.BoundPort}，绑定 {_bindAddress}");
     }
@@ -292,6 +299,7 @@ public sealed class VirtualCamera : IDisposable, IGvcpCallbacks
         {
             _transmitter.Stop();
             _transmitter.Start(target);
+            ApplyNetworkIdentity();   // 绑定网卡变化 → 同步刷新引导寄存器中的网络身份
             Log?.Invoke($"流通道已切换绑定到 {target}");
         }
     }
@@ -321,6 +329,129 @@ public sealed class VirtualCamera : IDisposable, IGvcpCallbacks
         }
 
         push.Push(frame);
+    }
+
+    // ———————————————————————————— 网络身份 ————————————————————————————
+
+    /// <summary>
+    /// 把流通道绑定网卡的网络参数写入相机身份与引导寄存器（当前 IP 0x0024/34/44 + 持久 IP 0x064C/65C/66C）。
+    /// Discovery 负载直接镜像这些寄存器：缺失时客户端会把相机识别为 0.0.0.0/00:00... 并提示修改 IP。
+    /// 绑定任意适配器（Any）时自动挑选首选网卡：优先“有 IPv4 网关的有线以太网”，其次任意非回环 IPv4。
+    /// </summary>
+    private void ApplyNetworkIdentity()
+    {
+        IPAddress? ip = _bindAddress.Equals(IPAddress.Any) ? PickDefaultNicAddress() : _bindAddress;
+        if (ip is null || ip.AddressFamily != AddressFamily.InterNetwork || IPAddress.Loopback.Equals(ip))
+        {
+            Log?.Invoke("警告：未找到可用 IPv4 网卡，相机网络身份未配置（客户端将显示 0.0.0.0）");
+            return;
+        }
+
+        var (subnet, gateway) = LookupNicNetworkConfig(ip);
+        _identity.CurrentIp = ip;
+        _identity.CurrentSubnetMask = subnet;
+        _identity.CurrentGateway = gateway;
+
+        uint ipValue = IpToUint(ip);
+        uint subnetValue = IpToUint(subnet);
+        uint gatewayValue = IpToUint(gateway);
+        _registers.WriteRegister(GevRegisters.CurrentIp, ipValue);
+        _registers.WriteRegister(GevRegisters.CurrentSubnet, subnetValue);
+        _registers.WriteRegister(GevRegisters.CurrentGateway, gatewayValue);
+        _registers.WriteRegister(GevRegisters.PersistentIp, ipValue);
+        _registers.WriteRegister(GevRegisters.PersistentSubnet, subnetValue);
+        _registers.WriteRegister(GevRegisters.PersistentGateway, gatewayValue);
+        Log?.Invoke($"相机网络身份：IP={ip} 子网={subnet} 网关={gateway}（MAC {_identity.MacString}）");
+    }
+
+    /// <summary>挑选首选网卡 IPv4：有网关的有线以太网优先，其次任意 Up 状态非回环 IPv4。</summary>
+    private static IPAddress? PickDefaultNicAddress()
+    {
+        IPAddress? fallback = null;
+        foreach (var nic in NetworkInterface.GetAllNetworkInterfaces())
+        {
+            if (nic.OperationalStatus != OperationalStatus.Up ||
+                nic.NetworkInterfaceType == NetworkInterfaceType.Loopback)
+            {
+                continue;
+            }
+
+            bool hasGateway = false;
+            foreach (var gateway in nic.GetIPProperties().GatewayAddresses)
+            {
+                if (gateway.Address.AddressFamily == AddressFamily.InterNetwork)
+                {
+                    hasGateway = true;
+                    break;
+                }
+            }
+
+            foreach (var address in nic.GetIPProperties().UnicastAddresses)
+            {
+                if (address.Address.AddressFamily != AddressFamily.InterNetwork)
+                {
+                    continue;
+                }
+
+                if (nic.NetworkInterfaceType == NetworkInterfaceType.Ethernet && hasGateway)
+                {
+                    return address.Address;   // 有网关的有线网卡优先
+                }
+
+                fallback ??= address.Address;
+            }
+        }
+
+        return fallback;
+    }
+
+    /// <summary>查询指定 IPv4 所在网卡的子网掩码与网关；找不到匹配网卡时回退 255.255.255.0 / 0.0.0.0。</summary>
+    private static (IPAddress Subnet, IPAddress Gateway) LookupNicNetworkConfig(IPAddress ip)
+    {
+        foreach (var nic in NetworkInterface.GetAllNetworkInterfaces())
+        {
+            var properties = nic.GetIPProperties();
+            IPAddress? subnet = null;
+            bool match = false;
+            foreach (var unicast in properties.UnicastAddresses)
+            {
+                if (unicast.Address.AddressFamily != AddressFamily.InterNetwork)
+                {
+                    continue;
+                }
+
+                subnet ??= unicast.IPv4Mask;
+                if (unicast.Address.Equals(ip))
+                {
+                    match = true;
+                    subnet = unicast.IPv4Mask;
+                }
+            }
+
+            if (!match)
+            {
+                continue;
+            }
+
+            IPAddress? gateway = null;
+            foreach (var gatewayAddress in properties.GatewayAddresses)
+            {
+                if (gatewayAddress.Address.AddressFamily == AddressFamily.InterNetwork)
+                {
+                    gateway = gatewayAddress.Address;
+                    break;
+                }
+            }
+
+            if (subnet is null || subnet.Equals(IPAddress.Any))
+            {
+                subnet = IPAddress.Parse("255.255.255.0");   // IPv4Mask 缺省时兜底 /24
+            }
+
+            return (subnet, gateway ?? IPAddress.Any);
+        }
+
+        return (IPAddress.Parse("255.255.255.0"), IPAddress.Any);
     }
 
     // ———————————————————————————— 采集线程 ————————————————————————————
@@ -384,8 +515,7 @@ public sealed class VirtualCamera : IDisposable, IGvcpCallbacks
     /// <summary>解析流目的地并发送一帧；目的地/端口无效或流通道未绑定时静默跳过（仅产帧与事件）。</summary>
     private void SendFrame(FrameBuffer frame)
     {
-        IPAddress? destination = ResolveStreamDestination();
-        int port = (int)(ReadRegisterValue(GevRegisters.Sc0Port) & 0xFFFF);
+        (IPAddress? destination, int port) = ResolveStreamTarget();
 
         if (destination is null || port == 0 || _transmitter.BoundPort == 0)
         {
@@ -395,12 +525,24 @@ public sealed class VirtualCamera : IDisposable, IGvcpCallbacks
         _transmitter.SendFrame(frame, destination, port, frame.BlockId, _config.PacketSize, _config.PacketDelayUs);
     }
 
-    /// <summary>流目的地：0x0D18 非 0 优先（客户端显式指定）；否则回退当前控制者 IP（契约 7）。</summary>
-    private IPAddress? ResolveStreamDestination()
+    /// <summary>
+    /// 流目的地解析：IP = 0x0D18（GevSCDA）非 0 优先，否则回退当前控制者 IP；
+    /// 端口 = 0x0D1C（GevSCSP，客户端写入其收流端口）非 0 优先，否则回退当前控制者端口（契约 7）。
+    /// 注意：0x0D18 为大端 u32，必须逐字节重组——IPAddress(long) 在小端机按 host 序解释
+    /// （0x7F000001 → "1.0.0.127"），不可用。
+    /// </summary>
+    private (IPAddress? Address, int Port) ResolveStreamTarget()
     {
-        uint raw = ReadRegisterValue(GevRegisters.Sc0DestIp);
-        return raw != 0 ? new IPAddress(raw) : _server.Controller?.Address;
+        uint rawIp = ReadRegisterValue(GevRegisters.Sc0DestIp);
+        IPAddress? address = rawIp != 0 ? UintToIp(rawIp) : _server.Controller?.Address;
+        uint rawPort = ReadRegisterValue(GevRegisters.Sc0DestPort) & 0xFFFF;
+        int port = rawPort != 0 ? (int)rawPort : _server.Controller?.Port ?? 0;
+        return (address, port);
     }
+
+    /// <summary>大端 u32 → IPAddress（IpToUint 的逆变换，逐字节重组，禁用 IPAddress(long) 构造）。</summary>
+    private static IPAddress UintToIp(uint value) =>
+        new([(byte)(value >> 24), (byte)(value >> 16), (byte)(value >> 8), (byte)value]);
 
     /// <summary>block_id 循环自增：1..65535，到 65535 后回到 1（仅采集线程调用）。</summary>
     private ushort NextBlockId()
@@ -434,14 +576,23 @@ public sealed class VirtualCamera : IDisposable, IGvcpCallbacks
     {
         // ===== 设备信息 / 能力（标准引导区，只读）=====
         _registers.DefineRegister(GevRegisters.Version, 0x00010002u, "Version", RegisterAccess.ReadOnly);          // GV 1.2
-        _registers.DefineRegister(GevRegisters.DeviceMode, 0, "DeviceMode", RegisterAccess.ReadOnly);              // bit31=0 小端
+        // bit31=1 大端设备：引导区与 GenICam 寄存器均为大端，与 XML 各寄存器节点的 Endianess 声明一致
+        _registers.DefineRegister(GevRegisters.DeviceMode, 0x80000000u, "DeviceMode", RegisterAccess.ReadOnly);
         _registers.DefineRegister(GevRegisters.MacHigh, MacRegisterHigh(), "DeviceMacAddressHigh", RegisterAccess.ReadOnly);
         _registers.DefineRegister(GevRegisters.MacLow, MacRegisterLow(), "DeviceMacAddressLow", RegisterAccess.ReadOnly);
         _registers.DefineRegister(GevRegisters.SupportedIpConfig, 0x5u, "SupportedIpConfiguration", RegisterAccess.ReadOnly); // 持久 IP + LLA
         _registers.DefineRegister(GevRegisters.CurrentIpConfig, 0x1u, "CurrentIpConfiguration", RegisterAccess.ReadOnly);      // 持久 IP 生效
         _registers.DefineRegister(GevRegisters.NetworkIfCount, 1, "NumberOfNetworkInterfaces", RegisterAccess.ReadOnly);
+        _registers.DefineRegister(GevRegisters.LinkSpeed0, 1000, "LinkSpeed0", RegisterAccess.ReadOnly);           // 千兆
         _registers.DefineRegister(GevRegisters.MessageChannelCount, 0, "NumberOfMessageChannels", RegisterAccess.ReadOnly);
         _registers.DefineRegister(GevRegisters.StreamChannelCount, 1, "NumberOfStreamChannels", RegisterAccess.ReadOnly);
+        _registers.DefineRegister(GevRegisters.ActionSignalCount, 0, "NumberOfActionSignals", RegisterAccess.ReadOnly);
+        _registers.DefineRegister(GevRegisters.ActiveLinkCount, 1, "NumberOfActiveLinks", RegisterAccess.ReadOnly);
+        _registers.DefineRegister(GevRegisters.StreamChannelCaps, 0, "StreamChannelCapabilities", RegisterAccess.ReadOnly);
+        _registers.DefineRegister(GevRegisters.MessageChannelCaps, 0, "MessageChannelCapabilities", RegisterAccess.ReadOnly);
+        _registers.DefineRegister(GevRegisters.DiscoveryAckDelay, 0, "DiscoveryAckDelay", RegisterAccess.ReadOnly);
+        _registers.DefineRegister(GevRegisters.DeviceConfiguration, 0, "DeviceConfiguration");
+        _registers.DefineRegister(GevRegisters.PendingAckTimeout, 0, "PendingAckTimeout");
         // GVCP 能力：bit1=WriteMem、bit2=PacketResend（Aravis create_stream 据此启用重发）
         _registers.DefineRegister(GevRegisters.GvcpCapability,
             0x2u | 0x4u, "GvcpCapability", RegisterAccess.ReadOnly);
@@ -472,17 +623,27 @@ public sealed class VirtualCamera : IDisposable, IGvcpCallbacks
         // 控制权：GvcpServer 在 WriteReg 分发层仲裁 0x0A00 并自行落表，此表项供客户端回读
         _registers.DefineRegister(GevRegisters.ControlPrivilege, 0, "ControlPrivilege");
 
-        // ===== 流通道 0 =====
+        // ===== 流通道 0（GigE Vision 1.2 标准布局，VisionMaster/Aravis/pylon 按标准地址硬编码访问）=====
         // 0x0D04 语义（GigE Vision 标准）：低 16 位 = GVSP 包大小 + IP/UDP 28B 头；
         // bit31=FireTestPacket（自清零）、bit30=DoNotFragment、bit29=BigEndian。
-        _registers.DefineRegister(GevRegisters.Sc0Port, 0, "SC0Port");
+        _registers.DefineRegister(GevRegisters.Sc0Capability, 0x80000000u, "SC0Capability", RegisterAccess.ReadOnly); // bit31=支持包重发
         _registers.DefineRegister(GevRegisters.Sc0PacketSize, (uint)(_config.PacketSize + UdpOverhead), "SC0PacketSize",
             onWrite: OnScPsWritten);
         _registers.DefineRegister(GevRegisters.Sc0PacketDelay, _config.PacketDelayUs, "SC0PacketDelay",
             onWrite: value => _config.PacketDelayUs = value);
+        // 0x0D0C 标准测试包寄存器：bit0=FireTestPacket（与 0x0D04 bit31 同义，两处都响应）
+        _registers.DefineRegister(GevRegisters.Sc0Control, 0, "SC0FireTestPacket",
+            onWrite: OnScControlWritten);
         _registers.DefineRegister(GevRegisters.Sc0DestIp, 0, "SC0DestinationIpAddress");
+        _registers.DefineRegister(GevRegisters.Sc0DestPort, 0, "SC0DestinationPort");
         // 源端口由 Start() 回填；外部写由 OnWriteRegister 拦截回 WriteProtect
         _registers.DefineRegister(GevRegisters.Sc0SourcePort, 0, "SC0SourcePort");
+        // 0x0D20：VisionMaster 打开相机时必读（GV2=大端能力/GV1.2=时间戳控制），小端设备回 0，可写仅存储
+        _registers.DefineRegister(GevRegisters.Sc0BigEndianess, 0, "SC0BigEndianess");
+        _registers.DefineRegister(GevRegisters.Sc0TimestampFreq, 0x3B9ACA00u, "SC0TimestampTickFrequency", RegisterAccess.ReadOnly);
+        ulong scTimestamp = StopwatchToNs(Stopwatch.GetTimestamp());
+        _registers.DefineRegister(GevRegisters.Sc0TimestampHigh, (uint)(scTimestamp >> 32), "SC0TimestampHigh", RegisterAccess.ReadOnly);
+        _registers.DefineRegister(GevRegisters.Sc0TimestampLow, (uint)scTimestamp, "SC0TimestampLow", RegisterAccess.ReadOnly);
 
         // ===== 图像格式 / 采集控制（设备自定义区）=====
         _registers.DefineRegister(GevRegisters.RegWidth, (uint)_config.Width, "Width",
@@ -540,9 +701,9 @@ public sealed class VirtualCamera : IDisposable, IGvcpCallbacks
         _registers.DefineMemory(GevRegisters.ManufacturerName, 32, "ManufacturerName", RegisterAccess.ReadOnly);
         _registers.DefineMemory(GevRegisters.ModelName, 32, "ModelName", RegisterAccess.ReadOnly);
         _registers.DefineMemory(GevRegisters.DeviceVersion, 32, "DeviceVersion", RegisterAccess.ReadOnly);
-        _registers.DefineMemory(GevRegisters.ManufacturerInfo, 48, "ManufacturerInfo", RegisterAccess.ReadOnly);
+        _registers.DefineMemory(GevRegisters.ManufacturerInfo, 32, "ManufacturerInfo", RegisterAccess.ReadOnly);
         _registers.DefineMemory(GevRegisters.SerialNumber, 16, "SerialNumber", RegisterAccess.ReadOnly);
-        _registers.DefineMemory(GevRegisters.UserDefinedName, 64, "UserDefinedName", RegisterAccess.ReadOnly);
+        _registers.DefineMemory(GevRegisters.UserDefinedName, 16, "UserDefinedName", RegisterAccess.ReadOnly);
         _registers.DefineMemory(GevRegisters.XmlUrl, XmlUrlMemorySize, "XmlUrl", RegisterAccess.ReadOnly);
         _registers.DefineMemory(GevRegisters.XmlUrl1, XmlUrlMemorySize, "XmlUrl1", RegisterAccess.ReadOnly);   // 第二 URL，恒为空
         _registers.DefineMemory(GevRegisters.XmlBlobBase, XmlBlobMemorySize, "GenICamXml", RegisterAccess.ReadOnly);
@@ -550,9 +711,9 @@ public sealed class VirtualCamera : IDisposable, IGvcpCallbacks
         _registers.WriteMemoryDirect(GevRegisters.ManufacturerName, ToAsciiPadded(_identity.ManufacturerName, 32));
         _registers.WriteMemoryDirect(GevRegisters.ModelName, ToAsciiPadded(_identity.ModelName, 32));
         _registers.WriteMemoryDirect(GevRegisters.DeviceVersion, ToAsciiPadded(_identity.DeviceVersion, 32));
-        _registers.WriteMemoryDirect(GevRegisters.ManufacturerInfo, ToAsciiPadded(_identity.ManufacturerInfo, 48));
+        _registers.WriteMemoryDirect(GevRegisters.ManufacturerInfo, ToAsciiPadded(_identity.ManufacturerInfo, 32));
         _registers.WriteMemoryDirect(GevRegisters.SerialNumber, ToAsciiPadded(_identity.SerialNumber, 16));
-        _registers.WriteMemoryDirect(GevRegisters.UserDefinedName, ToAsciiPadded(_identity.UserDefinedName, 64));
+        _registers.WriteMemoryDirect(GevRegisters.UserDefinedName, ToAsciiPadded(_identity.UserDefinedName, 16));
     }
 
     /// <summary>生成 GenICam XML（UTF-8），灌入 0x00100000 blob 区与 0x0200 URL 区，返回 URL 字符串。</summary>
@@ -595,14 +756,25 @@ public sealed class VirtualCamera : IDisposable, IGvcpCallbacks
         }
     }
 
+    /// <summary>0x0D0C 写入钩子：bit0=FireTestPacket（自清零，触发测试包）；bit1/2 仅存储。</summary>
+    private void OnScControlWritten(uint value)
+    {
+        if ((value & ScControlFireTestBit) == 0)
+        {
+            return;
+        }
+
+        FireTestPacket();
+        _registers.WriteRegister(GevRegisters.Sc0Control, value & ~ScControlFireTestBit);   // 自清零回写
+    }
+
     /// <summary>
-    /// FireTestPacket（0x0D04 bit31）：按当前包大小向流目的地发送一个 GVSP 数据包，
+    /// FireTestPacket（0x0D04 bit31 / 0x0D0C bit0）：按当前包大小向流目的地发送一个 GVSP 数据包，
     /// 供客户端（Aravis auto_packet_size）探测路径 MTU；目的地无效时静默跳过。
     /// </summary>
     private void FireTestPacket()
     {
-        IPAddress? destination = ResolveStreamDestination();
-        int port = (int)(ReadRegisterValue(GevRegisters.Sc0Port) & 0xFFFF);
+        (IPAddress? destination, int port) = ResolveStreamTarget();
         if (destination is null || port == 0 || _transmitter.BoundPort == 0)
         {
             return;

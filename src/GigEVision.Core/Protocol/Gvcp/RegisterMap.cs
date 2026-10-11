@@ -30,13 +30,30 @@ internal sealed class RegisterEntry
 /// <summary>
 /// 相机寄存器表：GVCP ReadReg/WriteReg/ReadMem/WriteMem 的存储后端。
 /// 内部用 <see cref="SortedDictionary{TKey,TValue}"/> 按地址组织：寄存器 = 4 字节值，内存区 = 字节数组。
-/// 未定义地址回 InvalidAddress(0x800B)；只读被写回 WriteProtect(0x800C)；
-/// 内存区访问未 4 字节对齐回 BadAlignment(0x800D)。所有公开成员线程安全。
+/// 未定义地址回 InvalidAddress(0x8003)；只读被写回 WriteProtect(0x8004)；
+/// 内存区访问未 4 字节对齐回 BadAlignment(0x8005)。所有公开成员线程安全。
+/// <para>宽容模式（<see cref="RegisterMap(bool)"/> lenientBootstrap=true）下，引导区（&lt; 0x00100000）
+/// 未定义地址的读/写不再报错，避免 VisionMaster/pylon 等客户端在打开相机阶段探测标准保留
+/// 寄存器（如 0x0D20/0x0A04）收到 InvalidAddress 后直接断开连接。</para>
 /// </summary>
 public sealed class RegisterMap
 {
+    /// <summary>GenICam 设备内存区起始地址：更低地址属 GigE Vision 引导寄存器空间。</summary>
+    public const uint DeviceMemoryBase = 0x00100000;
+
     private readonly object _lock = new();
     private readonly SortedDictionary<uint, RegisterEntry> _entries = new();
+    private readonly bool _lenientBootstrap;
+
+    /// <summary>
+    /// 创建寄存器表。<paramref name="lenientBootstrap"/> = true 启用引导区宽容模式：
+    /// [0x00000000, 0x00100000) 内未定义地址读取返回 0、写入静默忽略（均回 Success），
+    /// 已定义条目（含只读校验/写入钩子）不受影响；≥ 0x00100000 的 GenICam 设备区仍严格报错。
+    /// </summary>
+    public RegisterMap(bool lenientBootstrap = false)
+    {
+        _lenientBootstrap = lenientBootstrap;
+    }
 
     /// <summary>寄存器写入完成事件（addr, value）。仅 4 字节寄存器触发，内存区不触发。</summary>
     public event Action<uint, uint>? RegisterWritten;
@@ -125,7 +142,7 @@ public sealed class RegisterMap
         }
     }
 
-    /// <summary>读 4 字节寄存器（地址必须精确命中寄存器基址）。</summary>
+    /// <summary>读 4 字节寄存器（宽容模式下引导区未定义地址回 0）。</summary>
     public GevStatus ReadRegister(uint address, out uint value)
     {
         lock (_lock)
@@ -134,7 +151,9 @@ public sealed class RegisterMap
             if (entry is null || entry.IsMemory || entry.Address != address)
             {
                 value = 0;
-                return GevStatus.InvalidAddress;
+                return _lenientBootstrap && address < DeviceMemoryBase
+                    ? GevStatus.Success                 // 引导区宽容：标准保留地址读 0
+                    : GevStatus.InvalidAddress;
             }
 
             value = entry.Value;
@@ -154,7 +173,9 @@ public sealed class RegisterMap
             var entry = FindContainingNoLock(address);
             if (entry is null || entry.IsMemory || entry.Address != address)
             {
-                return GevStatus.InvalidAddress;
+                return _lenientBootstrap && address < DeviceMemoryBase
+                    ? GevStatus.Success                 // 引导区宽容：保留地址写忽略（不落表）
+                    : GevStatus.InvalidAddress;
             }
 
             if (entry.Access == RegisterAccess.ReadOnly)
@@ -277,6 +298,11 @@ public sealed class RegisterMap
 
             if (entry is null || !fits)
             {
+                if (_lenientBootstrap && wordAddress < DeviceMemoryBase)
+                {
+                    continue;   // 引导区宽容：未定义字跳过（与 ReadMemory 的补 0 语义对称）
+                }
+
                 return GevStatus.InvalidAddress;
             }
 
@@ -372,34 +398,32 @@ public sealed class RegisterMap
         return result;
     }
 
-    /// <summary>查找覆盖起始地址 address 的条目（floor 查找 + 覆盖判断；调用方须持锁）。</summary>
+    /// <summary>
+    /// 查找覆盖起始地址 address 的条目（floor 查找 + 覆盖判断；调用方须持锁）。
+    /// 注意：<see cref="SortedDictionary{TKey,TValue}"/> 没有区间视图 API（GetViewBetween 仅 SortedSet 提供）；
+    /// 其键按升序枚举，线性扫描保留最后一个 ≤ address 的键即可，寄存器条目数 &lt;100，开销可忽略。
+    /// </summary>
     private RegisterEntry? FindContainingNoLock(uint address)
     {
-        if (_entries.Count == 0)
-        {
-            return null;
-        }
-
-        // SortedDictionary 无 GetViewBetween；按排序顺序取最后一个 key <= address 的条目（floor）。
-        RegisterEntry? floor = null;
+        KeyValuePair<uint, RegisterEntry> floor = default;
+        bool found = false;
         foreach (var pair in _entries)
         {
-            if (pair.Key <= address)
+            if (pair.Key > address)
             {
-                floor = pair.Value;
+                break;   // 键升序：首次越界即无更近候选
             }
-            else
-            {
-                break;
-            }
+
+            floor = pair;
+            found = true;
         }
 
-        if (floor is null)
+        if (!found)
         {
             return null;
         }
 
-        return (ulong)address < (ulong)floor.Address + floor.Size ? floor : null;
+        return (ulong)address < (ulong)floor.Key + floor.Value.Size ? floor.Value : null;
     }
 
     /// <summary>大端写 u32 到目标字节片（内存读路径的寄存器取值）。</summary>

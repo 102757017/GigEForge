@@ -16,7 +16,9 @@ GenApi XML（local 模式）**，仅用于工业视觉测试与虚拟调试。
 ## 环境要求
 
 - Windows 10/11 x64
-- .NET 10 SDK
+- .NET 8 SDK
+- 可选：RoboDK + Python 3（`pip install robodk pillow`）用于仿真画面喂图
+- 可选：NuGet 包 AravisSharp 0.8.36（MPL-2.0）用于第三方客户端端到端验证
 
 ## 构建与运行
 
@@ -37,8 +39,8 @@ dotnet run --project samples/MinimalPush
 
 - **UDP 3956**：GVCP 控制通道（Discovery / 寄存器读写 / 心跳），客户端必须可达；
 - **UDP 5010**：SDK UDP 喂图端口（GVF1 协议，RoboDK 喂图用）；
-- **GVSP 流端口**：流通道源端口由系统随机分配（`0x0D00` 写入主机监听端口后作为目的地端口），
-  建议直接放行 `GigEForge.exe` / `dotnet.exe` 的入站 UDP，避免逐端口放行。
+- **GVSP 流端口**：流通道源端口由系统随机分配（写入 0x0D14 供客户端回读；客户端把收流端口写入 0x0D1C 后，
+  设备向该端口发送 GVSP），建议直接放行 `GigEForge.exe` / `dotnet.exe` 的入站 UDP，避免逐端口放行。
 
 跨网段/多网卡环境请关闭 AP 隔离（客户端隔离），必要时用 Force IP 把虚拟相机配置到与客户端同网段。
 
@@ -85,6 +87,15 @@ samples/robodk_feed.py            # RoboDK → GVF1 喂图脚本（可降级为�
 samples/AravisSharpClient/        # AravisSharp 第三方客户端验证样例（独立 csproj，不进 sln）
 ```
 
+## 技术说明
+
+**设备端协议栈为本项目自研。** 截至目前，.NET 生态没有可直接复用的「设备端 GigE Vision」库——现有
+开源实现（Aravis、GigEVision.Net 等）都是**客户端（host 端）**采集栈，模拟器类工具（如 ArvGvFakeCamera）
+也没有公开的动态喂帧 API。因此 GigEVision.Core 从零实现 GVCP/GVSP 经典模式与 GenICam local 模式。
+
+**客户端采集推荐 AravisSharp**（MPL-2.0，github.com/aboccag/AravisSharp）：Aravis 原生库的 C# 绑定，
+Windows 上原生 DLL 随 NuGet 包全打包、零系统安装，与本项目的虚拟相机组成完整的「虚拟相机 ↔ 标准客户端」
+闭环；pylon / VisionMaster / Harvesters 等商业与开源客户端同样可直接对接。
 
 ## 许可
 
