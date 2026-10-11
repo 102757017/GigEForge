@@ -82,8 +82,12 @@ public sealed class GvspTransmitter : IDisposable
     /// <summary>
     /// 发送一帧：Leader(packet_id=0) → Data(1..N，每片 ≤ packetSize-8 字节) → Trailer(N+1)。
     /// 整帧（含 Leader/Trailer）先写入 PacketCache 再逐包发送；packetDelayUs &gt; 0 时包间限速。
+    /// <paramref name="leaderPayloadType"/>：Chunk 模式传 0x4001（image | chunk 位）；
+    /// <paramref name="trailerChunkBlock"/>：Chunk 模式时追加在 Trailer 负载后的原始块
+    /// （如 [Width][Height][ChunkID][Size] 16 字节），null = 普通图像帧。
     /// </summary>
-    public void SendFrame(FrameBuffer frame, IPAddress destIp, int destPort, ushort blockId, ushort packetSize, uint packetDelayUs)
+    public void SendFrame(FrameBuffer frame, IPAddress destIp, int destPort, ushort blockId, ushort packetSize,
+        uint packetDelayUs, ushort leaderPayloadType = GvspPacket.PayloadTypeImage, byte[]? trailerChunkBlock = null)
     {
         ArgumentNullException.ThrowIfNull(frame);
         if (destIp is null)
@@ -110,7 +114,8 @@ public sealed class GvspTransmitter : IDisposable
         ReadOnlySpan<byte> pixels = frame.Data;
         int dataCount = (pixels.Length + chunkSize - 1) / chunkSize;
         var packets = new byte[dataCount + 2][];
-        packets[0] = GvspPacket.BuildLeader(blockId, frame.TimestampNs, (uint)frame.Format, (uint)frame.Width, (uint)frame.Height);
+        packets[0] = GvspPacket.BuildLeader(blockId, frame.TimestampNs, (uint)frame.Format, (uint)frame.Width,
+            (uint)frame.Height, leaderPayloadType);
         ushort packetId = 1;
         for (int offset = 0; offset < pixels.Length; offset += chunkSize)
         {
@@ -119,7 +124,16 @@ public sealed class GvspTransmitter : IDisposable
             packetId++;
         }
 
-        var trailer = GvspPacket.BuildTrailer(blockId, (uint)frame.Height);
+        var trailer = GvspPacket.BuildTrailer(blockId, (uint)frame.Height, leaderPayloadType);
+        if (trailerChunkBlock is { Length: > 0 })
+        {
+            // Chunk 模式：Trailer 负载后追加原始 Chunk 块（Trailer 包总长 = 8 + 8 + chunk.Length）
+            var extended = new byte[trailer.Length + trailerChunkBlock.Length];
+            trailer.CopyTo(extended, 0);
+            trailerChunkBlock.CopyTo(extended, trailer.Length);
+            trailer = extended;
+        }
+
         GvspPacket.SetPacketId(trailer, (ushort)(dataCount + 1));   // Trailer 的 packet_id = N+1
         packets[^1] = trailer;
 
@@ -161,11 +175,13 @@ public sealed class GvspTransmitter : IDisposable
     }
 
     /// <summary>
-    /// 发送 GVSP 测试包（FireTestPacket 路径 MTU 探测用）：单个 Data 包，
-    /// UDP 载荷 = packetSize 字节（GVSP 包大小，含 8B GVSP 包头）。
-    /// 客户端只校验收到的字节数，不解析内容。不写入缓存、不计入统计。
+    /// 发送 GVSP 测试包（FireTestPacket 路径 MTU 探测用）：单个 UDP 报文，
+    /// <b>UDP 载荷长度必须精确等于调用方给定的 payloadBytes</b>——按 v2 语义，
+    /// 客户端（Aravis auto_packet_size）写 0x0D04 后以此校验：载荷 == 0x0D04 低 16 位 - 28（IP+UDP 头），
+    /// 且必须发到 (0x0D18, 0x0D00 低 16 位) 的 socket，一个字节不差。内容不参与校验
+    /// （前两字节置伪 GVSP status=0 便于抓包辨识）。不写入缓存、不计入统计。
     /// </summary>
-    public void SendTestPacket(IPAddress destIp, int destPort, int packetSize)
+    public void SendTestPacket(IPAddress destIp, int destPort, int payloadBytes)
     {
         ArgumentNullException.ThrowIfNull(destIp);
 
@@ -181,7 +197,7 @@ public sealed class GvspTransmitter : IDisposable
             return;
         }
 
-        int chunk = Math.Max(0, packetSize - GvspPacket.HeaderSize);
+        int chunk = Math.Max(0, payloadBytes - GvspPacket.HeaderSize);
         var packet = GvspPacket.BuildData(1, blockId: 0, new byte[chunk]);
         try
         {

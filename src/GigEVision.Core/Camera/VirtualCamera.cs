@@ -2,7 +2,6 @@ using System.Diagnostics;
 using System.Net;
 using System.Net.NetworkInformation;
 using System.Net.Sockets;
-using System.Text;
 using GigEVision.Core.GenICam;
 using GigEVision.Core.Imaging;
 using GigEVision.Core.Protocol.Gvcp;
@@ -82,17 +81,23 @@ public sealed class VirtualCamera : IDisposable, IGvcpCallbacks
     /// <summary>GenICam XML blob 内存区大小（256KB 上限，契约 7）。</summary>
     private const int XmlBlobMemorySize = 256 * 1024;
 
-    /// <summary>GVSP 包的 IP/UDP 头开销（IP 20 + UDP 8）：0x0D04 寄存器低 16 位 = GVSP 包大小 + 28。</summary>
+    /// <summary>GVSP 包的 IP/UDP 头开销（IP 20 + UDP 8）：0x0D04 低 16 位 = 包大小（IP 包总长，v2 语义）。</summary>
     private const int UdpOverhead = 28;
 
-    /// <summary>0x0D04 寄存器 bit31：FireTestPacket（自清零，与 0x0D0C bit0 同义，兼容新旧客户端）。</summary>
+    /// <summary>0x0D04 寄存器 bit31：FireTestPacket（写 1 触发测试包后自清零，GenApi Bit0）。</summary>
     private const uint ScPsFireTestBit = 0x80000000u;
 
-    /// <summary>0x0D04 寄存器回写时保留的标志位掩码（bit30=DoNotFragment、bit29=BigEndian）。</summary>
-    private const uint ScPsFlagsKeepMask = 0x60000000u;
+    /// <summary>0x0D04 低 16 位包大小的合法上限（IP 包总长，字节；超出回退 1500 语义由写入方夹紧）。</summary>
+    private const int MaxScPacketSize = 16400;
 
-    /// <summary>0x0D0C 标准测试包寄存器 bit0：FireTestPacket（自清零，GigE Vision 标准地址）。</summary>
-    private const uint ScControlFireTestBit = 0x00000001u;
+    /// <summary>GenICam 特性区 PixelFormat 的唯一合法值（PFNC Mono8，与 XML 枚举一致）。</summary>
+    private const uint PfncMono8 = 0x01080001u;
+
+    /// <summary>Chunk 模式 Leader/Trailer 的 payload_type（image | chunk 位）。</summary>
+    private const ushort PayloadTypeImageChunk = 0x4001;
+
+    /// <summary>触发模式下等待 TriggerSoftware 的超时（毫秒）。</summary>
+    private const int TriggerWaitMs = 1000;
 
     /// <summary>采集/喂图线程退出等待上限（毫秒）。</summary>
     private const int ThreadJoinTimeoutMs = 1500;
@@ -117,6 +122,11 @@ public sealed class VirtualCamera : IDisposable, IGvcpCallbacks
     private volatile bool _running;
     private volatile bool _streaming;
     private ushort _blockId = 1;                        // block_id 循环计数（仅采集线程访问）
+    private string _genicamUrl = string.Empty;          // GenICam XML local URL（BuildRegisters 填充）
+    private uint _acquisitionMode;                      // GenICam AcquisitionMode（0=Off 1=Continuous 2=SingleFrame）
+    private uint _triggerMode;                          // GenICam TriggerMode（0=Off 1=On）
+    private bool _chunkModeActive;                      // GenICam ChunkModeActive
+    private readonly SemaphoreSlim _softwareTrigger = new(0, 1);   // TriggerSoftware 信号（软触发一帧）
     private bool _disposed;
 
     /// <summary>创建虚拟相机：构建寄存器表 / GenICam XML / GVCP 服务与 GVSP 发送器（identity 为空时用默认身份）。</summary>
@@ -127,8 +137,7 @@ public sealed class VirtualCamera : IDisposable, IGvcpCallbacks
         _transmitter = new GvspTransmitter(_stats);
         _transmitter.Log += message => Log?.Invoke(message);
 
-        BuildRegisters();
-        GenICamUrl = BuildGenICamBlob();
+        BuildRegisters();   // 内部末尾构建 GenICam XML 并填充 _genicamUrl / XML 清单寄存器
         _registers.RegisterWritten += OnRegisterWritten;
     }
 
@@ -148,7 +157,7 @@ public sealed class VirtualCamera : IDisposable, IGvcpCallbacks
 
     /// <summary>GenICam XML 的 URL 字符串："local:///GigEForge.xml;00100000;&lt;字节数hex&gt;"
     /// （Aravis local URL 格式：local:///&lt;文件名&gt;;&lt;地址 hex&gt;;&lt;大小 hex&gt;，地址在前、大小在后）。</summary>
-    public string GenICamUrl { get; }
+    public string GenICamUrl => _genicamUrl;
 
     /// <summary>
     /// 帧源：采集线程每周期调用 AcquireFrame。null 时用 TestPatternGenerator 兜底
@@ -459,12 +468,20 @@ public sealed class VirtualCamera : IDisposable, IGvcpCallbacks
     /// <summary>
     /// 采集循环：周期 = 1000/Fps 毫秒；先粗睡至剩约 2ms，再 SpinWait 到点（契约 7）。
     /// 帧来源：Source.AcquireFrame → null 且图案未关（≠0）时用 TestPatternGenerator 兜底；
-    /// 时间戳填设备单调时钟（纳秒），BlockId 自 1 循环自增。
+    /// 时间戳填设备单调时钟（纳秒，tick 频率声明 1 GHz），BlockId 自 1 循环自增。
+    /// GenICam 语义：TriggerMode=On 时等待 TriggerSoftware 写入后才出帧；
+    /// AcquisitionMode=SingleFrame 出一帧后自动停止。
     /// </summary>
     private void AcquisitionLoop()
     {
         while (_streaming)
         {
+            // 触发模式（TriggerMode=On）：等待 TriggerSoftware 写入再出帧，超时则继续等待不出帧
+            if (_triggerMode != 0 && !_softwareTrigger.Wait(TriggerWaitMs))
+            {
+                continue;
+            }
+
             // 周期按当前 Fps 动态取值：客户端改帧率寄存器后下一帧即生效
             int fps = Math.Clamp(_config.Fps, MinFps, MaxFps);
             long periodTicks = Math.Max(1, 1000 / fps) * Stopwatch.Frequency / 1000;
@@ -486,6 +503,14 @@ public sealed class VirtualCamera : IDisposable, IGvcpCallbacks
                     frame.BlockId = NextBlockId();
                     SendFrame(frame);
                     FrameStreamed?.Invoke(frame);   // 目的地无效时同样触发（仅跳过实际发送）
+
+                    // SingleFrame：出一帧后自动停止采集（GenICam AcquisitionMode=SingleFrame 语义；
+                    // 采集线程内调用，JoinThread 防自等待）
+                    if (_acquisitionMode == 2)
+                    {
+                        StopAcquisition();
+                        return;
+                    }
                 }
             }
             catch (Exception ex)
@@ -512,7 +537,8 @@ public sealed class VirtualCamera : IDisposable, IGvcpCallbacks
         }
     }
 
-    /// <summary>解析流目的地并发送一帧；目的地/端口无效或流通道未绑定时静默跳过（仅产帧与事件）。</summary>
+    /// <summary>解析流目的地并发送一帧；目的地/端口无效或流通道未绑定时静默跳过（仅产帧与事件）。
+    /// Chunk 模式（GenICam ChunkModeActive=1）时 Leader/Trailer payload_type=0x4001 且 Trailer 追加 Chunk 块。</summary>
     private void SendFrame(FrameBuffer frame)
     {
         (IPAddress? destination, int port) = ResolveStreamTarget();
@@ -522,12 +548,38 @@ public sealed class VirtualCamera : IDisposable, IGvcpCallbacks
             return;     // 契约 7：目的地与端口都无效 → 跳过发送，仅产出帧
         }
 
-        _transmitter.SendFrame(frame, destination, port, frame.BlockId, _config.PacketSize, _config.PacketDelayUs);
+        ushort payloadType = _chunkModeActive ? PayloadTypeImageChunk : GvspPacket.PayloadTypeImage;
+        byte[]? chunkBlock = _chunkModeActive ? BuildChunkTrailerBlock(frame) : null;
+        _transmitter.SendFrame(frame, destination, port, frame.BlockId, _config.PacketSize,
+            _config.PacketDelayUs, payloadType, chunkBlock);
     }
 
     /// <summary>
-    /// 流目的地解析：IP = 0x0D18（GevSCDA）非 0 优先，否则回退当前控制者 IP；
-    /// 端口 = 0x0D1C（GevSCSP，客户端写入其收流端口）非 0 优先，否则回退当前控制者端口（契约 7）。
+    /// Chunk 模式 Trailer 追加块（16 字节，ChunkID 与 GigEForge.xml 的 &lt;ChunkID&gt;0x00000001 一致）：
+    /// [Width u32 BE][Height u32 BE][ChunkID=1 u32 BE][Size=8 u32 BE]；
+    /// ChunkWidth/ChunkHeight 节点以 ChunkPort 基址 + 内偏移 0/4 读取本块。
+    /// </summary>
+    private static byte[] BuildChunkTrailerBlock(FrameBuffer frame)
+    {
+        uint w = (uint)frame.Width;
+        uint h = (uint)frame.Height;
+        var block = new byte[16];
+        block[0] = (byte)(w >> 24);
+        block[1] = (byte)(w >> 16);
+        block[2] = (byte)(w >> 8);
+        block[3] = (byte)w;
+        block[4] = (byte)(h >> 24);
+        block[5] = (byte)(h >> 16);
+        block[6] = (byte)(h >> 8);
+        block[7] = (byte)h;
+        block[11] = 0x01;   // ChunkID = 0x00000001
+        block[15] = 0x08;   // Chunk 数据长度 = 8
+        return block;
+    }
+
+    /// <summary>
+    /// 流目的地解析（v2 标准语义）：IP = 0x0D18（GevSCDA）非 0 优先，否则回退当前控制者 IP；
+    /// 端口 = 0x0D00（GevSCPHostPort，客户端写入其收流端口）低 16 位非 0 优先，否则回退当前控制者端口。
     /// 注意：0x0D18 为大端 u32，必须逐字节重组——IPAddress(long) 在小端机按 host 序解释
     /// （0x7F000001 → "1.0.0.127"），不可用。
     /// </summary>
@@ -535,7 +587,7 @@ public sealed class VirtualCamera : IDisposable, IGvcpCallbacks
     {
         uint rawIp = ReadRegisterValue(GevRegisters.Sc0DestIp);
         IPAddress? address = rawIp != 0 ? UintToIp(rawIp) : _server.Controller?.Address;
-        uint rawPort = ReadRegisterValue(GevRegisters.Sc0DestPort) & 0xFFFF;
+        uint rawPort = ReadRegisterValue(GevRegisters.Sc0HostPort) & 0xFFFF;
         int port = rawPort != 0 ? (int)rawPort : _server.Controller?.Port ?? 0;
         return (address, port);
     }
@@ -588,14 +640,13 @@ public sealed class VirtualCamera : IDisposable, IGvcpCallbacks
         _registers.DefineRegister(GevRegisters.StreamChannelCount, 1, "NumberOfStreamChannels", RegisterAccess.ReadOnly);
         _registers.DefineRegister(GevRegisters.ActionSignalCount, 0, "NumberOfActionSignals", RegisterAccess.ReadOnly);
         _registers.DefineRegister(GevRegisters.ActiveLinkCount, 1, "NumberOfActiveLinks", RegisterAccess.ReadOnly);
-        _registers.DefineRegister(GevRegisters.StreamChannelCaps, 0, "StreamChannelCapabilities", RegisterAccess.ReadOnly);
-        _registers.DefineRegister(GevRegisters.MessageChannelCaps, 0, "MessageChannelCapabilities", RegisterAccess.ReadOnly);
         _registers.DefineRegister(GevRegisters.DiscoveryAckDelay, 0, "DiscoveryAckDelay", RegisterAccess.ReadOnly);
         _registers.DefineRegister(GevRegisters.DeviceConfiguration, 0, "DeviceConfiguration");
         _registers.DefineRegister(GevRegisters.PendingAckTimeout, 0, "PendingAckTimeout");
-        // GVCP 能力：bit1=WriteMem、bit2=PacketResend（Aravis create_stream 据此启用重发）
+        // GVCP 能力：bit0=Concatenation | bit1=WriteMem | bit2=PacketResend → 0x00000007（Aravis 据此启用 WriteMem/重发；
+        // ★ 本地址严禁放 XML URL 字符串——客户端会把 ASCII 当能力位解析）
         _registers.DefineRegister(GevRegisters.GvcpCapability,
-            0x2u | 0x4u, "GvcpCapability", RegisterAccess.ReadOnly);
+            0x1u | 0x2u | 0x4u, "GvcpCapability", RegisterAccess.ReadOnly);
         _registers.DefineRegister(GevRegisters.TickFreqHigh, 0, "TimestampTickFrequencyHigh", RegisterAccess.ReadOnly);
         _registers.DefineRegister(GevRegisters.TickFreqLow, 0x3B9ACA00u, "TimestampTickFrequencyLow", RegisterAccess.ReadOnly); // 1e9 Hz
         ulong timestampNow = StopwatchToNs(Stopwatch.GetTimestamp());
@@ -623,27 +674,23 @@ public sealed class VirtualCamera : IDisposable, IGvcpCallbacks
         // 控制权：GvcpServer 在 WriteReg 分发层仲裁 0x0A00 并自行落表，此表项供客户端回读
         _registers.DefineRegister(GevRegisters.ControlPrivilege, 0, "ControlPrivilege");
 
-        // ===== 流通道 0（GigE Vision 1.2 标准布局，VisionMaster/Aravis/pylon 按标准地址硬编码访问）=====
-        // 0x0D04 语义（GigE Vision 标准）：低 16 位 = GVSP 包大小 + IP/UDP 28B 头；
-        // bit31=FireTestPacket（自清零）、bit30=DoNotFragment、bit29=BigEndian。
-        _registers.DefineRegister(GevRegisters.Sc0Capability, 0x80000000u, "SC0Capability", RegisterAccess.ReadOnly); // bit31=支持包重发
+        // ===== 流通道 0（GigE Vision 标准布局 v2，与 Aravis 注入节点一字不差）=====
+        // 0x0D00 GevSCPHostPort：客户端写入它收流 socket 的 UDP 端口（建流与测试包探测前都会写）；
+        // 0x0D04 GevSCPSPacketSize：低 16 位 = 包大小（IP 包总长），bit31=FireTestPacket（自清零）、
+        //        bit30=DNF、bit29=BigEndian；存储客户端写入的原始值（读回 == 写入，勿做 +28 夹紧）。
+        _registers.DefineRegister(GevRegisters.Sc0HostPort, 0, "SC0HostPort");
         _registers.DefineRegister(GevRegisters.Sc0PacketSize, (uint)(_config.PacketSize + UdpOverhead), "SC0PacketSize",
+            validate: ValidateScPacketSize,
             onWrite: OnScPsWritten);
         _registers.DefineRegister(GevRegisters.Sc0PacketDelay, _config.PacketDelayUs, "SC0PacketDelay",
             onWrite: value => _config.PacketDelayUs = value);
-        // 0x0D0C 标准测试包寄存器：bit0=FireTestPacket（与 0x0D04 bit31 同义，两处都响应）
-        _registers.DefineRegister(GevRegisters.Sc0Control, 0, "SC0FireTestPacket",
-            onWrite: OnScControlWritten);
         _registers.DefineRegister(GevRegisters.Sc0DestIp, 0, "SC0DestinationIpAddress");
-        _registers.DefineRegister(GevRegisters.Sc0DestPort, 0, "SC0DestinationPort");
-        // 源端口由 Start() 回填；外部写由 OnWriteRegister 拦截回 WriteProtect
-        _registers.DefineRegister(GevRegisters.Sc0SourcePort, 0, "SC0SourcePort");
-        // 0x0D20：VisionMaster 打开相机时必读（GV2=大端能力/GV1.2=时间戳控制），小端设备回 0，可写仅存储
-        _registers.DefineRegister(GevRegisters.Sc0BigEndianess, 0, "SC0BigEndianess");
-        _registers.DefineRegister(GevRegisters.Sc0TimestampFreq, 0x3B9ACA00u, "SC0TimestampTickFrequency", RegisterAccess.ReadOnly);
-        ulong scTimestamp = StopwatchToNs(Stopwatch.GetTimestamp());
-        _registers.DefineRegister(GevRegisters.Sc0TimestampHigh, (uint)(scTimestamp >> 32), "SC0TimestampHigh", RegisterAccess.ReadOnly);
-        _registers.DefineRegister(GevRegisters.Sc0TimestampLow, (uint)scTimestamp, "SC0TimestampLow", RegisterAccess.ReadOnly);
+        // 0x0D1C GevSCSP：设备流源端口，RO 语义但写容忍（部分客户端会探测写）——
+        // 定义为 RW + onWrite 回填真实值，外部写回 Success 但不改变设备状态
+        _registers.DefineRegister(GevRegisters.Sc0SourcePort, 0, "SC0SourcePort", onWrite: OnScSourcePortWritten);
+        // 0x0D20 GevSCCA：恒 0（不声明 multipart → arv-test Multipart 按预期 SUCCESS）；写容忍
+        _registers.DefineRegister(GevRegisters.Sc0Capability, 0, "SC0Capability", onWrite: OnScCapabilityWritten);
+        _registers.DefineRegister(GevRegisters.Sc0Configuration, 0, "SC0Configuration");
 
         // ===== 图像格式 / 采集控制（设备自定义区）=====
         _registers.DefineRegister(GevRegisters.RegWidth, (uint)_config.Width, "Width",
@@ -697,6 +744,75 @@ public sealed class VirtualCamera : IDisposable, IGvcpCallbacks
                 : GevStatus.InvalidParameter,
             onWrite: value => _config.Pattern = (PatternType)value);
 
+        // ===== GenICam 标准特性区（0x10000+，与 GenICam\GigEForge.xml v2 一一对应）=====
+        // arv-test 判定依赖：Width/Height Integer、AcquisitionFrameRate/ExposureTime/Gain 必须为 Float（IEEE754 位图）、
+        // AcquisitionMode 枚举含 Continuous/SingleFrame、TriggerSoftware Command 存在、Chunk 五件套齐全。
+        _registers.DefineRegister(GevFeature.Width, (uint)_config.Width, "GenWidth",
+            onWrite: OnFeatureWidthWritten);
+        _registers.DefineRegister(GevFeature.Height, (uint)_config.Height, "GenHeight",
+            onWrite: OnFeatureHeightWritten);
+        _registers.DefineRegister(GevFeature.OffsetX, 0, "GenOffsetX",
+            validate: value => value == 0 ? GevStatus.Success : GevStatus.InvalidParameter);
+        _registers.DefineRegister(GevFeature.OffsetY, 0, "GenOffsetY",
+            validate: value => value == 0 ? GevStatus.Success : GevStatus.InvalidParameter);
+        _registers.DefineRegister(GevFeature.SensorWidth, 1280, "GenSensorWidth", RegisterAccess.ReadOnly);
+        _registers.DefineRegister(GevFeature.SensorHeight, 720, "GenSensorHeight", RegisterAccess.ReadOnly);
+        _registers.DefineRegister(GevFeature.PixelFormat, PfncMono8, "GenPixelFormat",
+            validate: value => value == PfncMono8 ? GevStatus.Success : GevStatus.InvalidParameter,
+            onWrite: _ => _config.Format = PixelFormatCode.Mono8);
+        _registers.DefineRegister(GevFeature.AcquisitionMode, 0, "GenAcquisitionMode",
+            validate: value => value <= 2 ? GevStatus.Success : GevStatus.InvalidParameter,
+            onWrite: value => _acquisitionMode = value);
+        _registers.DefineRegister(GevFeature.AcquisitionCommand, 0, "GenAcquisitionCommand",
+            onWrite: value =>
+            {
+                if (value == 1)
+                {
+                    StartAcquisition();
+                }
+                else if (value == 0)
+                {
+                    StopAcquisition();
+                }
+            });
+        _registers.DefineRegister(GevFeature.TriggerMode, 0, "GenTriggerMode",
+            validate: value => value <= 1 ? GevStatus.Success : GevStatus.InvalidParameter,
+            onWrite: value => _triggerMode = value);
+        _registers.DefineRegister(GevFeature.TriggerSource, 1, "GenTriggerSource",
+            validate: value => value <= 1 ? GevStatus.Success : GevStatus.InvalidParameter);
+        _registers.DefineRegister(GevFeature.TriggerSoftware, 0, "GenTriggerSoftware",
+            onWrite: value =>
+            {
+                if (value == 1)
+                {
+                    _softwareTrigger.Release();   // 触发一帧（采集线程在触发模式下等待本信号）
+                }
+            });
+        _registers.DefineRegister(GevFeature.ExposureTime, FloatToBits(10000f), "GenExposureTime");
+        _registers.DefineRegister(GevFeature.Gain, FloatToBits(0f), "GenGain");
+        _registers.DefineRegister(GevFeature.FrameRate, FloatToBits(30f), "GenFrameRate",
+            onWrite: value =>
+            {
+                float fps = BitsToFloat(value);
+                if (float.IsFinite(fps) && fps >= MinFps)
+                {
+                    _config.Fps = (int)MathF.Round(fps);
+                }
+            });
+        _registers.DefineRegister(GevFeature.TriggerActivation, 0, "GenTriggerActivation",
+            validate: value => value == 0 ? GevStatus.Success : GevStatus.InvalidParameter);
+        _registers.DefineRegister(GevFeature.ChunkModeActive, 0, "GenChunkModeActive",
+            validate: value => value <= 1 ? GevStatus.Success : GevStatus.InvalidParameter,
+            onWrite: value => _chunkModeActive = value != 0);
+        _registers.DefineRegister(GevFeature.ChunkEnableWidth, 1, "GenChunkEnableWidth",
+            validate: value => value <= 1 ? GevStatus.Success : GevStatus.InvalidParameter);
+        _registers.DefineRegister(GevFeature.ChunkEnableHeight, 1, "GenChunkEnableHeight",
+            validate: value => value <= 1 ? GevStatus.Success : GevStatus.InvalidParameter);
+        _registers.DefineRegister(GevFeature.ChunkSelector, 0, "GenChunkSelector",
+            validate: value => value <= 1 ? GevStatus.Success : GevStatus.InvalidParameter);
+        _registers.DefineRegister(GevFeature.TriggerSelector, 0, "GenTriggerSelector",
+            validate: value => value == 0 ? GevStatus.Success : GevStatus.InvalidParameter);
+
         // ===== ASCII 名称区 / XML（只读内存区，内容经 WriteMemoryDirect 灌入）=====
         _registers.DefineMemory(GevRegisters.ManufacturerName, 32, "ManufacturerName", RegisterAccess.ReadOnly);
         _registers.DefineMemory(GevRegisters.ModelName, 32, "ModelName", RegisterAccess.ReadOnly);
@@ -705,7 +821,7 @@ public sealed class VirtualCamera : IDisposable, IGvcpCallbacks
         _registers.DefineMemory(GevRegisters.SerialNumber, 16, "SerialNumber", RegisterAccess.ReadOnly);
         _registers.DefineMemory(GevRegisters.UserDefinedName, 16, "UserDefinedName", RegisterAccess.ReadOnly);
         _registers.DefineMemory(GevRegisters.XmlUrl, XmlUrlMemorySize, "XmlUrl", RegisterAccess.ReadOnly);
-        _registers.DefineMemory(GevRegisters.XmlUrl1, XmlUrlMemorySize, "XmlUrl1", RegisterAccess.ReadOnly);   // 第二 URL，恒为空
+        _registers.DefineMemory(GevRegisters.XmlUrl1, XmlUrlMemorySize, "XmlUrl1", RegisterAccess.ReadOnly);   // 第二 URL，镜像同一文件
         _registers.DefineMemory(GevRegisters.XmlBlobBase, XmlBlobMemorySize, "GenICamXml", RegisterAccess.ReadOnly);
 
         _registers.WriteMemoryDirect(GevRegisters.ManufacturerName, ToAsciiPadded(_identity.ManufacturerName, 32));
@@ -714,65 +830,120 @@ public sealed class VirtualCamera : IDisposable, IGvcpCallbacks
         _registers.WriteMemoryDirect(GevRegisters.ManufacturerInfo, ToAsciiPadded(_identity.ManufacturerInfo, 32));
         _registers.WriteMemoryDirect(GevRegisters.SerialNumber, ToAsciiPadded(_identity.SerialNumber, 16));
         _registers.WriteMemoryDirect(GevRegisters.UserDefinedName, ToAsciiPadded(_identity.UserDefinedName, 16));
-    }
 
-    /// <summary>生成 GenICam XML（UTF-8），灌入 0x00100000 blob 区与 0x0200 URL 区，返回 URL 字符串。</summary>
-    private string BuildGenICamBlob()
-    {
-        string xml = GenICamXml.BuildDefault(_identity, (uint)_config.Width, (uint)_config.Height);
-        var xmlBytes = Encoding.UTF8.GetBytes(xml);
-        if (xmlBytes.Length > XmlBlobMemorySize)
-        {
-            xmlBytes = xmlBytes[..XmlBlobMemorySize];   // 防御性截断（模板约 12KB，远低于 256KB 上限）
-        }
-
-        // Aravis/GenICam local URL 格式：local:///<文件名>;<地址 hex>;<大小 hex>（地址在前、大小在后）
-        string url = $"local:///GigEForge.xml;{GevRegisters.XmlBlobBase:X8};{xmlBytes.Length:X8}";
-        _registers.WriteMemoryDirect(GevRegisters.XmlBlobBase, xmlBytes);
-        _registers.WriteMemoryDirect(GevRegisters.XmlUrl, ToAsciiPadded(url, XmlUrlMemorySize));
-        return url;
-    }
-
-    /// <summary>0x0D04 写入钩子：低 16 位 = 包大小（含 IP/UDP 28B 头），夹紧后回写；bit31 = FireTestPacket（自清零）。</summary>
-    private void OnScPsWritten(uint value)
-    {
-        if ((value & ScPsFireTestBit) != 0)
-        {
-            FireTestPacket();       // FireTestPacket 为自清零位：回写时不再置位
-        }
-
-        int regSize = (int)(value & 0xFFFF);
-        if (regSize == 0)
-        {
-            return;                 // 仅标志位写入（如 FireTestPacket）：不改包大小
-        }
-
-        int gvspSize = Math.Clamp(regSize - UdpOverhead, MinPacketSize, MaxPacketSize);
-        _config.PacketSize = (ushort)gvspSize;
-        uint normalized = (value & ScPsFlagsKeepMask) | (uint)(gvspSize + UdpOverhead);
-        if (normalized != value)
-        {
-            _registers.WriteRegister(GevRegisters.Sc0PacketSize, normalized);   // 回写归一化值（本钩子再次触发即收敛）
-        }
-    }
-
-    /// <summary>0x0D0C 写入钩子：bit0=FireTestPacket（自清零，触发测试包）；bit1/2 仅存储。</summary>
-    private void OnScControlWritten(uint value)
-    {
-        if ((value & ScControlFireTestBit) == 0)
-        {
-            return;
-        }
-
-        FireTestPacket();
-        _registers.WriteRegister(GevRegisters.Sc0Control, value & ~ScControlFireTestBit);   // 自清零回写
+        // ===== GenICam XML blob / URL 区 / XML 清单寄存器（大小与 CRC32 动态计算）=====
+        BuildGenICamBlob();
     }
 
     /// <summary>
-    /// FireTestPacket（0x0D04 bit31 / 0x0D0C bit0）：按当前包大小向流目的地发送一个 GVSP 数据包，
-    /// 供客户端（Aravis auto_packet_size）探测路径 MTU；目的地无效时静默跳过。
+    /// 生成 GenICam XML（嵌入资源 GigEForge.xml v2 + 身份注入，UTF-8），灌入 0x00100000 blob 区，
+    /// URL 写入 0x0200 与 0x0400（Aravis 读 0x0200），并把 XML 清单寄存器（0x0920-0x0930，含动态
+    /// 大小与 CRC32）按初值落表；URL 同步到 <see cref="GenICamUrl"/>。
     /// </summary>
-    private void FireTestPacket()
+    private void BuildGenICamBlob()
+    {
+        var xmlBytes = GenICamXml.BuildXmlBytes(_identity);
+        if (xmlBytes.Length > XmlBlobMemorySize)
+        {
+            xmlBytes = xmlBytes[..XmlBlobMemorySize];   // 防御性截断（模板约 29KB，远低于 256KB 上限）
+        }
+
+        // Aravis/GenICam local URL 格式：local:///<文件名>;<地址 hex>;<大小 hex>（地址在前、大小在后）
+        string url = GenICamXml.BuildUrl(xmlBytes.Length);
+        _registers.DefineRegister(GevRegisters.XmlFileCount, 1, "XmlFileCount", RegisterAccess.ReadOnly);
+        _registers.DefineRegister(GevRegisters.XmlFileSelect, 0, "XmlFileSelect", RegisterAccess.ReadOnly);
+        _registers.DefineRegister(GevRegisters.XmlFileSize, (uint)xmlBytes.Length, "XmlFileSize", RegisterAccess.ReadOnly);
+        _registers.DefineRegister(GevRegisters.XmlFileCrc, Crc32Hash.Compute(xmlBytes), "XmlFileCrc32", RegisterAccess.ReadOnly);
+        _registers.DefineRegister(GevRegisters.XmlFileVersion, 0x00010000u, "XmlFileVersion", RegisterAccess.ReadOnly);
+        _registers.WriteMemoryDirect(GevRegisters.XmlBlobBase, xmlBytes);
+        _registers.WriteMemoryDirect(GevRegisters.XmlUrl, ToAsciiPadded(url, XmlUrlMemorySize));
+        _registers.WriteMemoryDirect(GevRegisters.XmlUrl1, ToAsciiPadded(url, XmlUrlMemorySize));
+        _genicamUrl = url;
+    }
+
+    /// <summary>
+    /// 0x0D04 写入钩子（v2 语义）：值 bit15:0 = 包大小（IP 包总长，原样存储读回==写入），
+    /// bit31 = FireTestPacket（自清零回写并触发测试包），bit30/bit29（DNF/BigEndian）仅存储。
+    /// </summary>
+    private void OnScPsWritten(uint value)
+    {
+        uint size = value & 0xFFFF;
+        if ((value & ScPsFireTestBit) != 0)
+        {
+            // 自清零：存储值永远不带 bit31（回写会再次触发本钩子，size 同步分支幂等）
+            _registers.WriteRegister(GevRegisters.Sc0PacketSize, value & ~ScPsFireTestBit);
+            FireTestPacket((int)size);
+        }
+
+        if (size is >= (uint)MinPacketSize and <= (uint)MaxScPacketSize)
+        {
+            // 包大小有效：同步引擎 GVSP 包大小（config 存 GVSP 口径 = IP 总长 - 28）
+            _config.PacketSize = (ushort)Math.Clamp((int)size - UdpOverhead, MinPacketSize, MaxPacketSize);
+        }
+    }
+
+    /// <summary>0x0D04 低 16 位包大小合法性：0（纯标志位写入）或 [576, 16400]。</summary>
+    private static GevStatus ValidateScPacketSize(uint value)
+    {
+        uint size = value & 0xFFFF;
+        return size == 0 || (size >= (uint)MinPacketSize && size <= (uint)MaxScPacketSize)
+            ? GevStatus.Success
+            : GevStatus.InvalidParameter;
+    }
+
+    /// <summary>0x0D1C 写容忍钩子：接受写入但立即回填真实流源端口（RO 语义，写不生效）。</summary>
+    private void OnScSourcePortWritten(uint value)
+    {
+        uint actual = (uint)_transmitter.BoundPort;
+        if (value != actual)
+        {
+            _registers.WriteRegister(GevRegisters.Sc0SourcePort, actual);
+        }
+    }
+
+    /// <summary>0x0D20 写容忍钩子：接受写入但立即回填 0（能力位恒 0：无 multipart/多区能力）。</summary>
+    private void OnScCapabilityWritten(uint value)
+    {
+        if (value != 0)
+        {
+            _registers.WriteRegister(GevRegisters.Sc0Capability, 0);
+        }
+    }
+
+    /// <summary>GenICam Width 写入钩子：夹紧到 [16..8192] 回写（读回与 XML PayloadSize 口径一致），并同步引擎。</summary>
+    private void OnFeatureWidthWritten(uint value)
+    {
+        int clamped = Math.Clamp((int)value, MinDimension, MaxDimension);
+        if ((uint)clamped != value)
+        {
+            _registers.WriteRegister(GevFeature.Width, (uint)clamped);   // 回写再次触发本钩子完成同步
+            return;
+        }
+
+        _config.Width = clamped;
+        UpdatePayloadSize();
+    }
+
+    /// <summary>GenICam Height 写入钩子：夹紧到 [16..8192] 回写，并同步引擎。</summary>
+    private void OnFeatureHeightWritten(uint value)
+    {
+        int clamped = Math.Clamp((int)value, MinDimension, MaxDimension);
+        if ((uint)clamped != value)
+        {
+            _registers.WriteRegister(GevFeature.Height, (uint)clamped);
+            return;
+        }
+
+        _config.Height = clamped;
+        UpdatePayloadSize();
+    }
+
+    /// <summary>
+    /// FireTestPacket（0x0D04 bit31，自清零）：按写入值低 16 位向流目的地 (0x0D18, 0x0D00) 发送
+    /// 一个 UDP 报文，载荷长度必须精确 = 包大小 - 28（IP+UDP 头），供 Aravis auto_packet_size 探测
+    /// 路径 MTU（差一字节判失败并二分塌缩）；目的地无效或载荷非法时静默跳过。
+    /// </summary>
+    private void FireTestPacket(int wireSize)
     {
         (IPAddress? destination, int port) = ResolveStreamTarget();
         if (destination is null || port == 0 || _transmitter.BoundPort == 0)
@@ -780,8 +951,14 @@ public sealed class VirtualCamera : IDisposable, IGvcpCallbacks
             return;
         }
 
-        _transmitter.SendTestPacket(destination, port, _config.PacketSize);
-        Log?.Invoke($"已发送 GVSP 测试包（FireTestPacket，{_config.PacketSize}B → {destination}:{port}）");
+        int payload = wireSize - UdpOverhead;
+        if (payload <= 0)
+        {
+            return;
+        }
+
+        _transmitter.SendTestPacket(destination, port, payload);
+        Log?.Invoke($"已发送测试包（FireTestPacket，UDP 载荷 {payload}B → {destination}:{port}）");
     }
 
     /// <summary>PayloadSize = W × H × 每像素字节数（契约 5.5）。</summary>
@@ -809,6 +986,18 @@ public sealed class VirtualCamera : IDisposable, IGvcpCallbacks
         value >= MinDimension && value <= MaxDimension
             ? GevStatus.Success
             : GevStatus.InvalidParameter;
+
+    /// <summary>GenICam Width/Height（XML Inc=1）：16..8192（超出范围由 onWrite 钩子夹紧回写）。</summary>
+    private static GevStatus ValidateFeatureDimension(uint value) =>
+        value >= MinDimension && value <= MaxDimension
+            ? GevStatus.Success
+            : GevStatus.InvalidParameter;
+
+    /// <summary>IEEE754 单精度 → u32 位图（FloatReg 寄存器存储口径，.NET 5+ 官方转换 API）。</summary>
+    private static uint FloatToBits(float value) => BitConverter.SingleToUInt32Bits(value);
+
+    /// <summary>u32 位图 → IEEE754 单精度（FloatReg 寄存器读取口径）。</summary>
+    private static float BitsToFloat(uint bits) => BitConverter.UInt32BitsToSingle(bits);
 
     /// <summary>读寄存器便捷封装：未定义地址回 0。</summary>
     private uint ReadRegisterValue(uint address) =>
@@ -838,21 +1027,29 @@ public sealed class VirtualCamera : IDisposable, IGvcpCallbacks
     // ———————————————————————————— IGvcpCallbacks（GvcpServer 回调）————————————————————————————
 
     /// <summary>
-    /// 寄存器写入前置校验（GvcpServer 外部 WriteReg 路径）：只做语义校验与只读拦截，
+    /// 寄存器写入前置校验（GvcpServer 外部 WriteReg/WriteMem 路径）：只做语义校验与只读拦截，
     /// 不自行落表——返回 Success 后由 GvcpServer 统一写入寄存器表，onWrite 钩子负责联动动作。
     /// </summary>
     GevStatus IGvcpCallbacks.OnWriteRegister(uint address, uint value, IPEndPoint from)
     {
-        // 设备自维护寄存器：映射层定义为 ReadWrite 仅为允许内部刷新（ForceIP / 源端口回填），
+        // 设备自维护 / 清单寄存器：映射层定义为 RW 仅为允许内部刷新（ForceIP / 源端口回填），
         // 对外一律回写保护
         if (address is GevRegisters.RegPayloadSize
-            or GevRegisters.Sc0SourcePort
+            or GevRegisters.XmlFileCount or GevRegisters.XmlFileSelect
+            or GevRegisters.XmlFileSize or GevRegisters.XmlFileCrc or GevRegisters.XmlFileVersion
             or GevRegisters.CurrentIp or GevRegisters.CurrentSubnet or GevRegisters.CurrentGateway)
         {
             return GevStatus.WriteProtect;
         }
 
-        // 语义校验（与映射层 validate 钩子一致，先行拦截以便 GvcpServer 回准确错误状态）
+        // SC0 写容忍寄存器（GevSCSP 源端口 / GevSCCA 能力）：接受写入但不改变设备状态
+        // （映射层 RW + onWrite 钩子立即回填真实值，见 OnScSourcePortWritten / OnScCapabilityWritten）
+        if (address is GevRegisters.Sc0SourcePort or GevRegisters.Sc0Capability)
+        {
+            return GevStatus.Success;
+        }
+
+        // 语义校验（旧自定义区 0x140000 + 新标准特性区 0x10000，与映射层 validate 一致）
         return address switch
         {
             GevRegisters.RegWidth => ValidateWidth(value),
@@ -864,6 +1061,29 @@ public sealed class VirtualCamera : IDisposable, IGvcpCallbacks
                 ? GevStatus.Success
                 : GevStatus.InvalidParameter,
             GevRegisters.RegTestPattern => value <= MaxTestPattern
+                ? GevStatus.Success
+                : GevStatus.InvalidParameter,
+
+            GevFeature.Width => ValidateFeatureDimension(value),
+            GevFeature.Height => ValidateFeatureDimension(value),
+            GevFeature.OffsetX or GevFeature.OffsetY => value == 0
+                ? GevStatus.Success
+                : GevStatus.InvalidParameter,
+            GevFeature.PixelFormat => value == PfncMono8
+                ? GevStatus.Success
+                : GevStatus.InvalidParameter,
+            GevFeature.AcquisitionMode => value <= 2
+                ? GevStatus.Success
+                : GevStatus.InvalidParameter,
+            GevFeature.TriggerMode or GevFeature.ChunkModeActive
+                or GevFeature.ChunkEnableWidth or GevFeature.ChunkEnableHeight
+                or GevFeature.ChunkSelector => value <= 1
+                ? GevStatus.Success
+                : GevStatus.InvalidParameter,
+            GevFeature.TriggerSource => value <= 1
+                ? GevStatus.Success
+                : GevStatus.InvalidParameter,
+            GevFeature.TriggerActivation or GevFeature.TriggerSelector => value == 0
                 ? GevStatus.Success
                 : GevStatus.InvalidParameter,
             _ => GevStatus.Success,
@@ -945,6 +1165,7 @@ public sealed class VirtualCamera : IDisposable, IGvcpCallbacks
         Stop();
         _server.Dispose();
         _transmitter.Dispose();
+        _softwareTrigger.Dispose();
         _registers.RegisterWritten -= OnRegisterWritten;
 
         FrameStreamed = null;

@@ -28,6 +28,9 @@ public static class GvspPacket
     /// <summary>payload_type：图像（1）。</summary>
     public const ushort PayloadTypeImage = 0x0001;
 
+    /// <summary>payload_type 附加位：帧内含 Chunk 数据（image | chunk = 0x4001）。</summary>
+    public const ushort PayloadTypeChunkBit = 0x4000;
+
     /// <summary>packet_id 字段位宽掩码（24 位，位于包头 [5..7]）。</summary>
     public const uint PacketIdMask = 0x00FFFFFF;
 
@@ -39,18 +42,19 @@ public static class GvspPacket
 
     /// <summary>
     /// 构建帧头包（8+36 字节）。packet_id 固定 0。
-    /// 负载布局：[0..1] flags=0，[2..3] payload_type=1，
+    /// 负载布局：[0..1] flags=0，[2..3] payload_type（默认 1；Chunk 模式传 0x4001），
     /// [4..7]/[8..11] 时间戳（u64 纳秒拆高/低 32 位），
     /// [12..15] 像素格式（PFNC），[16..19] size_x，[20..23] size_y，
     /// [24..27] offset_x=0，[28..31] offset_y=0，[32..33]/[34..35] padding=0。
     /// </summary>
-    public static byte[] BuildLeader(ushort blockId, ulong timestampNs, uint pixelFormat, uint width, uint height)
+    public static byte[] BuildLeader(ushort blockId, ulong timestampNs, uint pixelFormat, uint width, uint height,
+        ushort payloadType = PayloadTypeImage)
     {
         var packet = new byte[HeaderSize + LeaderPayloadSize];
         FillHeader(packet, ContentTypeLeader, packetId: 0, blockId);
 
         Span<byte> p = packet.AsSpan(HeaderSize);
-        WriteU16(p, 2, PayloadTypeImage);
+        WriteU16(p, 2, payloadType);
         WriteU32(p, 4, (uint)(timestampNs >> 32));
         WriteU32(p, 8, (uint)timestampNs);
         WriteU32(p, 12, pixelFormat);
@@ -61,16 +65,16 @@ public static class GvspPacket
     }
 
     /// <summary>
-    /// 构建帧尾包（8+8 字节）。负载布局：[0..3] payload_type=1（u32），[4..7] size_y（负载高度）。
+    /// 构建帧尾包（8+8 字节）。负载布局：[0..3] payload_type（与 Leader 一致），[4..7] size_y（负载高度）。
     /// 注意：Trailer 的 packet_id = N+1，本方法先填 0，由发送器用 <see cref="SetPacketId"/> 修正。
     /// </summary>
-    public static byte[] BuildTrailer(ushort blockId, uint payloadHeight)
+    public static byte[] BuildTrailer(ushort blockId, uint payloadHeight, ushort payloadType = PayloadTypeImage)
     {
         var packet = new byte[HeaderSize + TrailerPayloadSize];
         FillHeader(packet, ContentTypeTrailer, packetId: 0, blockId);
 
         Span<byte> p = packet.AsSpan(HeaderSize);
-        WriteU32(p, 0, PayloadTypeImage);
+        WriteU32(p, 0, payloadType);
         WriteU32(p, 4, payloadHeight);
         return packet;
     }

@@ -11,4 +11,8 @@
   <ItemGroup>
     <PackageReference Include="System.Drawing.Common" Version="8.0.0" />
   </ItemGroup>
+  <ItemGroup>
+    <!-- GenICam XML v2 模板（arv-test 对齐版）随程序集分发，GenICamXml 运行时加载 -->
+    <EmbeddedResource Include="GenICam\GigEForge.xml" />
+  </ItemGroup>
 </Project>

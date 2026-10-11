@@ -16,7 +16,7 @@ GenApi XML（local 模式）**，仅用于工业视觉测试与虚拟调试。
 ## 环境要求
 
 - Windows 10/11 x64
-- .NET 8 SDK
+- .NET 10 SDK
 - 可选：RoboDK + Python 3（`pip install robodk pillow`）用于仿真画面喂图
 - 可选：NuGet 包 AravisSharp 0.8.36（MPL-2.0）用于第三方客户端端到端验证
 
@@ -76,7 +76,7 @@ docs/ROBODK.md                    # RoboDK 喂图方案（拓扑、分步操作�
 src/GigEVision.Core/              # 设备端协议栈 + 图像管线 + SDK（类库）
   Protocol/Gvcp/                  #   GVCP：发现/读写寄存器/心跳/控制权
   Protocol/Gvsp/                  #   GVSP：Leader/Data/Trailer、包重发缓存、统计
-  GenICam/                        #   GenApi XML（local 模式）生成
+  GenICam/                        #   GenApi XML v2 模板（嵌入资源）+ 身份注入 + CRC32
   Imaging/                        #   测试图案、图片加载、像素转换、帧源抽象
   Camera/                         #   VirtualCamera 门面 + 相机身份
   Sdk/                            #   GigECameraServer（一行上线虚拟相机）
@@ -92,6 +92,13 @@ samples/AravisSharpClient/        # AravisSharp 第三方客户端验证样例�
 **设备端协议栈为本项目自研。** 截至目前，.NET 生态没有可直接复用的「设备端 GigE Vision」库——现有
 开源实现（Aravis、GigEVision.Net 等）都是**客户端（host 端）**采集栈，模拟器类工具（如 ArvGvFakeCamera）
 也没有公开的动态喂帧 API。因此 GigEVision.Core 从零实现 GVCP/GVSP 经典模式与 GenICam local 模式。
+
+**GenICam XML v2（arv-test 对齐版，当前内嵌模板）**：SC0 流通道块按 GigE Vision 标准布局实现
+（0x0D00=GevSCPHostPort RW / 0x0D04=包大小原值存储+bit31 FireTestPacket 自清零 / 0x0D1C=GevSCSP RO / 
+0x0D20=SC 能力恒 0），XML 清单寄存器（0x920-0x930）动态计算大小与 CRC32，GVCP 能力（0x934）=0x00000007；
+FireTestPacket 测试包载荷精确 = 包大小 − 28，发往 (0x0D18, 0x0D00) 的 socket。标准特性区 0x10000+ 提供
+Gain/ExposureTime/FrameRate（Float）、触发与 Chunk 全套节点，arv-test-0.8 的 Properties / Acquisition /
+MultipleAcquisition / SoftwareTrigger / Chunks / Multipart 检查项均可按预期通过。详见 `docs/PROTOCOL.md`。
 
 **客户端采集推荐 AravisSharp**（MPL-2.0，github.com/aboccag/AravisSharp）：Aravis 原生库的 C# 绑定，
 Windows 上原生 DLL 随 NuGet 包全打包、零系统安装，与本项目的虚拟相机组成完整的「虚拟相机 ↔ 标准客户端」

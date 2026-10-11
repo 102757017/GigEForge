@@ -1,0 +1,710 @@
+<?xml version="1.0" encoding="utf-8"?>
+
+<!-- ============================================================================
+     GigEForge 虚拟相机 GenICam XML（v2 — 2025 arv-test 对齐版）
+     依据 Aravis main(≈0.8.3x) 源码逐字核实：
+       - arvgvcpprivate.h            引导寄存器权威地址
+       - arvgvdevice.c 注入节点      SC0 块布局（0x0D00+0x40*SEL）
+       - arvgcregisternode.c         BigEndian 寄存器位序：
+             GenApi <Bit>N</Bit>    = 寄存器值 bit (31-N)（Bit0 = 值 bit31）
+             GenApi LSB=31/MSB=16   = 寄存器值 bit 15..0（低 16 位）
+       - arvgvdevice.c auto_packet_size:
+             测试包 UDP 载荷必须精确 = ArvGevSCPSPacketSize - 28 字节
+             且被写到 ArvGevSCDA(0x0D18) + ArvGevSCPHostPort(0x0D00 低16位) 的
+             socket 收到（注意不是 GVCP 控制 socket！）
+     特性寄存器区 0x00010000+ 与 DeviceRegisters.patch.cs 一一对应。
+     ============================================================================ -->
+
+<RegisterDescription
+        ModelName="VirtualCam-01"
+        VendorName="GigEForge"
+        StandardNameSpace="None"
+        SchemaMajorVersion="1"
+        SchemaMinorVersion="0"
+        SchemaSubMinorVersion="1"
+        MajorVersion="2"
+        MinorVersion="1"
+        SubMinorVersion="0"
+        ToolTip="GigEForge virtual camera"
+        ProductGuid="8f4a2c1e-6b3d-4e2f-9a1c-5d7e3b2a1c0f"
+        VersionGuid="2c6e4a8b-1d3f-4b5a-9e7c-8a2b4d6f1e3c"
+        xmlns="http://www.genicam.org/GenApi/Version_1_0"
+        xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+        xsi:schemaLocation="http://www.genicam.org/GenApi/Version_1_0 GenApiSchema.xsd">
+
+        <Category Name="Root" NameSpace="Standard">
+                <pFeature>DeviceControl</pFeature>
+                <pFeature>ImageFormatControl</pFeature>
+                <pFeature>AcquisitionControl</pFeature>
+                <pFeature>AnalogControl</pFeature>
+                <pFeature>ChunkControl</pFeature>
+                <pFeature>TransportLayerControl</pFeature>
+        </Category>
+
+        <!-- ============================ DeviceControl ============================ -->
+
+        <Category Name="DeviceControl" NameSpace="Standard">
+                <pFeature>DeviceVendorName</pFeature>
+                <pFeature>DeviceModelName</pFeature>
+                <pFeature>DeviceManufacturerInfo</pFeature>
+                <pFeature>DeviceID</pFeature>
+                <pFeature>DeviceUserID</pFeature>
+                <pFeature>DeviceVersion</pFeature>
+        </Category>
+
+        <StringReg Name="DeviceVendorName" NameSpace="Standard">
+                <Address>0x48</Address>
+                <Length>32</Length>
+                <AccessMode>RO</AccessMode>
+                <pPort>Device</pPort>
+        </StringReg>
+
+        <StringReg Name="DeviceModelName" NameSpace="Standard">
+                <Address>0x68</Address>
+                <Length>32</Length>
+                <AccessMode>RO</AccessMode>
+                <pPort>Device</pPort>
+        </StringReg>
+
+        <StringReg Name="DeviceManufacturerInfo" NameSpace="Standard">
+                <Address>0xA8</Address>
+                <Length>32</Length>
+                <AccessMode>RO</AccessMode>
+                <pPort>Device</pPort>
+        </StringReg>
+
+        <StringReg Name="DeviceID" NameSpace="Standard">
+                <Address>0xD8</Address>
+                <Length>16</Length>
+                <AccessMode>RO</AccessMode>
+                <pPort>Device</pPort>
+        </StringReg>
+
+        <StringReg Name="DeviceUserID" NameSpace="Standard">
+                <Address>0xE8</Address>
+                <Length>16</Length>
+                <AccessMode>RW</AccessMode>
+                <pPort>Device</pPort>
+        </StringReg>
+
+        <StringReg Name="DeviceVersion" NameSpace="Standard">
+                <Address>0x88</Address>
+                <Length>32</Length>
+                <AccessMode>RO</AccessMode>
+                <pPort>Device</pPort>
+        </StringReg>
+
+        <!-- ========================== ImageFormatControl ========================= -->
+
+        <Category Name="ImageFormatControl" NameSpace="Standard">
+                <pFeature>SensorWidth</pFeature>
+                <pFeature>SensorHeight</pFeature>
+                <pFeature>WidthMax</pFeature>
+                <pFeature>HeightMax</pFeature>
+                <pFeature>Width</pFeature>
+                <pFeature>Height</pFeature>
+                <pFeature>OffsetX</pFeature>
+                <pFeature>OffsetY</pFeature>
+                <pFeature>PixelFormat</pFeature>
+                <pFeature>PayloadSize</pFeature>
+        </Category>
+
+        <Integer Name="SensorWidth" NameSpace="Standard">
+                <Visibility>Expert</Visibility>
+                <pValue>SensorWidthReg</pValue>
+        </Integer>
+        <IntReg Name="SensorWidthReg" NameSpace="Custom">
+                <Address>0x00010010</Address>
+                <Length>4</Length>
+                <AccessMode>RO</AccessMode>
+                <pPort>Device</pPort>
+                <Sign>Unsigned</Sign>
+                <Endianess>BigEndian</Endianess>
+        </IntReg>
+
+        <Integer Name="SensorHeight" NameSpace="Standard">
+                <Visibility>Expert</Visibility>
+                <pValue>SensorHeightReg</pValue>
+        </Integer>
+        <IntReg Name="SensorHeightReg" NameSpace="Custom">
+                <Address>0x00010014</Address>
+                <Length>4</Length>
+                <AccessMode>RO</AccessMode>
+                <pPort>Device</pPort>
+                <Sign>Unsigned</Sign>
+                <Endianess>BigEndian</Endianess>
+        </IntReg>
+
+        <Integer Name="WidthMax" NameSpace="Standard">
+                <Visibility>Invisible</Visibility>
+                <pValue>SensorWidth</pValue>
+        </Integer>
+        <Integer Name="HeightMax" NameSpace="Standard">
+                <Visibility>Invisible</Visibility>
+                <pValue>SensorHeight</pValue>
+        </Integer>
+
+        <Integer Name="Width" NameSpace="Standard">
+                <pValue>WidthReg</pValue>
+                <Min>1</Min>
+                <pMax>WidthMax</pMax>
+                <Inc>1</Inc>
+        </Integer>
+        <IntReg Name="WidthReg" NameSpace="Custom">
+                <Address>0x00010000</Address>
+                <Length>4</Length>
+                <AccessMode>RW</AccessMode>
+                <pPort>Device</pPort>
+                <Cachable>NoCache</Cachable>
+                <Sign>Unsigned</Sign>
+                <Endianess>BigEndian</Endianess>
+        </IntReg>
+
+        <Integer Name="Height" NameSpace="Standard">
+                <pValue>HeightReg</pValue>
+                <Min>1</Min>
+                <pMax>HeightMax</pMax>
+                <Inc>1</Inc>
+        </Integer>
+        <IntReg Name="HeightReg" NameSpace="Custom">
+                <Address>0x00010004</Address>
+                <Length>4</Length>
+                <AccessMode>RW</AccessMode>
+                <pPort>Device</pPort>
+                <Cachable>NoCache</Cachable>
+                <Sign>Unsigned</Sign>
+                <Endianess>BigEndian</Endianess>
+        </IntReg>
+
+        <Integer Name="OffsetX" NameSpace="Standard">
+                <pValue>OffsetXReg</pValue>
+                <Min>0</Min>
+                <Max>0</Max>
+                <Inc>1</Inc>
+        </Integer>
+        <IntReg Name="OffsetXReg" NameSpace="Custom">
+                <Address>0x00010008</Address>
+                <Length>4</Length>
+                <AccessMode>RW</AccessMode>
+                <pPort>Device</pPort>
+                <Sign>Unsigned</Sign>
+                <Endianess>BigEndian</Endianess>
+        </IntReg>
+
+        <Integer Name="OffsetY" NameSpace="Standard">
+                <pValue>OffsetYReg</pValue>
+                <Min>0</Min>
+                <Max>0</Max>
+                <Inc>1</Inc>
+        </Integer>
+        <IntReg Name="OffsetYReg" NameSpace="Custom">
+                <Address>0x0001000C</Address>
+                <Length>4</Length>
+                <AccessMode>RW</AccessMode>
+                <pPort>Device</pPort>
+                <Sign>Unsigned</Sign>
+                <Endianess>BigEndian</Endianess>
+        </IntReg>
+
+        <Enumeration Name="PixelFormat" NameSpace="Standard">
+                <EnumEntry Name="Mono8" NameSpace="Standard">
+                        <Value>0x01080001</Value>
+                </EnumEntry>
+                <pValue>PixelFormatReg</pValue>
+        </Enumeration>
+        <IntReg Name="PixelFormatReg" NameSpace="Custom">
+                <Address>0x00010018</Address>
+                <Length>4</Length>
+                <AccessMode>RW</AccessMode>
+                <pPort>Device</pPort>
+                <Sign>Unsigned</Sign>
+                <Endianess>BigEndian</Endianess>
+        </IntReg>
+
+        <Integer Name="PayloadSize" NameSpace="Standard">
+                <Visibility>Invisible</Visibility>
+                <pValue>PayloadSizeKn</pValue>
+        </Integer>
+        <IntSwissKnife Name="PayloadSizeKn" NameSpace="Custom">
+                <pVariable Name="W">Width</pVariable>
+                <pVariable Name="H">Height</pVariable>
+                <Formula>W*H</Formula>
+        </IntSwissKnife>
+
+        <!-- ========================= AcquisitionControl ========================== -->
+
+        <Category Name="AcquisitionControl" NameSpace="Standard">
+                <pFeature>AcquisitionMode</pFeature>
+                <pFeature>AcquisitionFrameRate</pFeature>
+                <pFeature>ExposureTime</pFeature>
+                <pFeature>TriggerSelector</pFeature>
+                <pFeature>TriggerMode</pFeature>
+                <pFeature>TriggerSource</pFeature>
+                <pFeature>TriggerActivation</pFeature>
+                <pFeature>TriggerSoftware</pFeature>
+                <pFeature>AcquisitionStart</pFeature>
+                <pFeature>AcquisitionStop</pFeature>
+        </Category>
+
+        <Enumeration Name="AcquisitionMode" NameSpace="Standard">
+                <EnumEntry Name="Off" NameSpace="Standard">
+                        <Value>0</Value>
+                </EnumEntry>
+                <EnumEntry Name="Continuous" NameSpace="Standard">
+                        <Value>1</Value>
+                </EnumEntry>
+                <EnumEntry Name="SingleFrame" NameSpace="Standard">
+                        <Value>2</Value>
+                </EnumEntry>
+                <pValue>AcquisitionModeReg</pValue>
+        </Enumeration>
+        <IntReg Name="AcquisitionModeReg" NameSpace="Custom">
+                <Address>0x0001001C</Address>
+                <Length>4</Length>
+                <AccessMode>RW</AccessMode>
+                <pPort>Device</pPort>
+                <Sign>Unsigned</Sign>
+                <Endianess>BigEndian</Endianess>
+        </IntReg>
+
+        <Command Name="AcquisitionStart" NameSpace="Standard">
+                <pValue>AcquisitionCommandReg</pValue>
+                <CommandValue>1</CommandValue>
+        </Command>
+        <Command Name="AcquisitionStop" NameSpace="Standard">
+                <pValue>AcquisitionCommandReg</pValue>
+                <CommandValue>0</CommandValue>
+        </Command>
+        <IntReg Name="AcquisitionCommandReg" NameSpace="Custom">
+                <Address>0x00010020</Address>
+                <Length>4</Length>
+                <AccessMode>WO</AccessMode>
+                <pPort>Device</pPort>
+                <Sign>Unsigned</Sign>
+                <Endianess>BigEndian</Endianess>
+        </IntReg>
+
+        <!-- arv-test MultipleAcquisition 设 10Hz / 5Hz，FrameRate 子项按时间戳核对 ±10% -->
+        <Float Name="AcquisitionFrameRate" NameSpace="Standard">
+                <pValue>AcquisitionFrameRateReg</pValue>
+                <Min>1.0</Min>
+                <Max>60.0</Max>
+        </Float>
+        <FloatReg Name="AcquisitionFrameRateReg" NameSpace="Custom">
+                <Address>0x00010038</Address>
+                <Length>4</Length>
+                <AccessMode>RW</AccessMode>
+                <pPort>Device</pPort>
+                <Cachable>NoCache</Cachable>
+                <Endianess>BigEndian</Endianess>
+        </FloatReg>
+
+        <!-- arv-test 要求 Float 型 ExposureTime（µs）；Integer 型不会被识别 -->
+        <Float Name="ExposureTime" NameSpace="Standard">
+                <pValue>ExposureTimeReg</pValue>
+                <Min>10.0</Min>
+                <Max>1000000.0</Max>
+        </Float>
+        <FloatReg Name="ExposureTimeReg" NameSpace="Custom">
+                <Address>0x00010030</Address>
+                <Length>4</Length>
+                <AccessMode>RW</AccessMode>
+                <pPort>Device</pPort>
+                <Cachable>NoCache</Cachable>
+                <Endianess>BigEndian</Endianess>
+        </FloatReg>
+
+        <Enumeration Name="TriggerSelector" NameSpace="Standard">
+                <EnumEntry Name="FrameStart" NameSpace="Standard">
+                        <Value>0</Value>
+                </EnumEntry>
+                <pValue>TriggerSelectorReg</pValue>
+        </Enumeration>
+        <IntReg Name="TriggerSelectorReg" NameSpace="Custom">
+                <Address>0x00010050</Address>
+                <Length>4</Length>
+                <AccessMode>RW</AccessMode>
+                <pPort>Device</pPort>
+                <Sign>Unsigned</Sign>
+                <Endianess>BigEndian</Endianess>
+        </IntReg>
+
+        <Enumeration Name="TriggerMode" NameSpace="Standard">
+                <EnumEntry Name="Off" NameSpace="Standard">
+                        <Value>0</Value>
+                </EnumEntry>
+                <EnumEntry Name="On" NameSpace="Standard">
+                        <Value>1</Value>
+                </EnumEntry>
+                <pValue>TriggerModeReg</pValue>
+        </Enumeration>
+        <IntReg Name="TriggerModeReg" NameSpace="Custom">
+                <Address>0x00010024</Address>
+                <Length>4</Length>
+                <AccessMode>RW</AccessMode>
+                <pPort>Device</pPort>
+                <Sign>Unsigned</Sign>
+                <Endianess>BigEndian</Endianess>
+        </IntReg>
+
+        <Enumeration Name="TriggerSource" NameSpace="Standard">
+                <EnumEntry Name="Line0" NameSpace="Standard">
+                        <Value>0</Value>
+                </EnumEntry>
+                <EnumEntry Name="Software" NameSpace="Standard">
+                        <Value>1</Value>
+                </EnumEntry>
+                <pValue>TriggerSourceReg</pValue>
+        </Enumeration>
+        <IntReg Name="TriggerSourceReg" NameSpace="Custom">
+                <Address>0x00010028</Address>
+                <Length>4</Length>
+                <AccessMode>RW</AccessMode>
+                <pPort>Device</pPort>
+                <Sign>Unsigned</Sign>
+                <Endianess>BigEndian</Endianess>
+        </IntReg>
+
+        <Enumeration Name="TriggerActivation" NameSpace="Standard">
+                <EnumEntry Name="RisingEdge" NameSpace="Standard">
+                        <Value>0</Value>
+                </EnumEntry>
+                <pValue>TriggerActivationReg</pValue>
+        </Enumeration>
+        <IntReg Name="TriggerActivationReg" NameSpace="Custom">
+                <Address>0x0001003C</Address>
+                <Length>4</Length>
+                <AccessMode>RW</AccessMode>
+                <pPort>Device</pPort>
+                <Sign>Unsigned</Sign>
+                <Endianess>BigEndian</Endianess>
+        </IntReg>
+
+        <!-- arv-test 以「TriggerSoftware 是否存在」判定 SoftwareTrigger 支持与否 -->
+        <Command Name="TriggerSoftware" NameSpace="Standard">
+                <pValue>TriggerSoftwareReg</pValue>
+                <CommandValue>1</CommandValue>
+        </Command>
+        <IntReg Name="TriggerSoftwareReg" NameSpace="Custom">
+                <Address>0x0001002C</Address>
+                <Length>4</Length>
+                <AccessMode>WO</AccessMode>
+                <pPort>Device</pPort>
+                <Sign>Unsigned</Sign>
+                <Endianess>BigEndian</Endianess>
+        </IntReg>
+
+        <!-- ============================ AnalogControl ============================ -->
+
+        <Category Name="AnalogControl" NameSpace="Standard">
+                <pFeature>Gain</pFeature>
+        </Category>
+
+        <!-- arv-test 要求 Float 型 Gain（dB）；Integer GainRaw 仅作兜底 -->
+        <Float Name="Gain" NameSpace="Standard">
+                <pValue>GainReg</pValue>
+                <Min>0.0</Min>
+                <Max>12.0</Max>
+        </Float>
+        <FloatReg Name="GainReg" NameSpace="Custom">
+                <Address>0x00010034</Address>
+                <Length>4</Length>
+                <AccessMode>RW</AccessMode>
+                <pPort>Device</pPort>
+                <Cachable>NoCache</Cachable>
+                <Endianess>BigEndian</Endianess>
+        </FloatReg>
+
+        <!-- ============================= ChunkControl ============================ -->
+
+        <!-- Chunk 数据块（GVSP Trailer 追加，共 16 字节）：
+                  [Width u32 BE][Height u32 BE][ChunkID=0x00000001 u32 BE][Size=8 u32 BE]
+              ChunkID 必须与下方 <ChunkID> 一致；aravis 按 id 定位后以
+              「chunk 数据内偏移」访问 ChunkWidthReg/ChunkHeightReg。 -->
+        <Category Name="ChunkControl" NameSpace="Standard">
+                <pFeature>ChunkModeActive</pFeature>
+                <pFeature>ChunkSelector</pFeature>
+                <pFeature>ChunkEnable</pFeature>
+                <pFeature>ChunkWidth</pFeature>
+                <pFeature>ChunkHeight</pFeature>
+        </Category>
+
+        <Boolean Name="ChunkModeActive" NameSpace="Standard">
+                <pValue>ChunkModeActiveReg</pValue>
+                <OnValue>1</OnValue>
+                <OffValue>0</OffValue>
+        </Boolean>
+        <IntReg Name="ChunkModeActiveReg" NameSpace="Custom">
+                <Address>0x00010040</Address>
+                <Length>4</Length>
+                <AccessMode>RW</AccessMode>
+                <pPort>Device</pPort>
+                <Sign>Unsigned</Sign>
+                <Endianess>BigEndian</Endianess>
+        </IntReg>
+
+        <Enumeration Name="ChunkSelector" NameSpace="Standard">
+                <EnumEntry Name="Width" NameSpace="Standard">
+                        <Value>0</Value>
+                </EnumEntry>
+                <EnumEntry Name="Height" NameSpace="Standard">
+                        <Value>1</Value>
+                </EnumEntry>
+                <pValue>ChunkSelectorReg</pValue>
+        </Enumeration>
+        <IntReg Name="ChunkSelectorReg" NameSpace="Custom">
+                <Address>0x0001004C</Address>
+                <Length>4</Length>
+                <AccessMode>RW</AccessMode>
+                <pPort>Device</pPort>
+                <Sign>Unsigned</Sign>
+                <Endianess>BigEndian</Endianess>
+        </IntReg>
+
+        <Boolean Name="ChunkEnable" NameSpace="Standard">
+                <pValue>ChunkEnableReg</pValue>
+                <OnValue>1</OnValue>
+                <OffValue>0</OffValue>
+        </Boolean>
+        <IntSwissKnife Name="ChunkEnableAddr" NameSpace="Custom">
+                <pVariable Name="SEL">ChunkSelector</pVariable>
+                <Formula>0x00010044 + SEL*4</Formula>
+        </IntSwissKnife>
+        <IntReg Name="ChunkEnableReg" NameSpace="Custom">
+                <pAddress>ChunkEnableAddr</pAddress>
+                <Length>4</Length>
+                <AccessMode>RW</AccessMode>
+                <pPort>Device</pPort>
+                <Sign>Unsigned</Sign>
+                <Endianess>BigEndian</Endianess>
+        </IntReg>
+
+        <Integer Name="ChunkWidth" NameSpace="Standard">
+                <Visibility>Expert</Visibility>
+                <pValue>ChunkWidthReg</pValue>
+        </Integer>
+        <IntReg Name="ChunkWidthReg" NameSpace="Custom">
+                <Address>0</Address>
+                <Length>4</Length>
+                <AccessMode>RO</AccessMode>
+                <pPort>ChunkPort</pPort>
+                <Sign>Unsigned</Sign>
+                <Endianess>BigEndian</Endianess>
+        </IntReg>
+
+        <Integer Name="ChunkHeight" NameSpace="Standard">
+                <Visibility>Expert</Visibility>
+                <pValue>ChunkHeightReg</pValue>
+        </Integer>
+        <IntReg Name="ChunkHeightReg" NameSpace="Custom">
+                <Address>4</Address>
+                <Length>4</Length>
+                <AccessMode>RO</AccessMode>
+                <pPort>ChunkPort</pPort>
+                <Sign>Unsigned</Sign>
+                <Endianess>BigEndian</Endianess>
+        </IntReg>
+
+        <!-- ========================= TransportLayerControl ======================= -->
+        <!-- 地址/位序与 Aravis 注入节点(AravisProject/aravis src/arvgvdevice.c)一致：
+                  0x0D00 SCPHostPort   值 bit15:0 = 接收端(应用)端口（RW）
+                  0x0D04 SCPSPacketSize 值 bit15:0 = 包大小(IP总长, 4对齐)（RW）
+                          bit31 = FireTestPacket（GenApi Bit 0，自清零）
+                          bit30 = DoNotFragment（GenApi Bit 1）
+                          bit29 = BigEndian（GenApi Bit 2）
+                  0x0D08 SCPD           包间延迟（RW）
+                  0x0D18 SCDA           目的 IPv4（RW，4 字节即网络序）
+                  0x0D1C SCSP           相机流源端口（RO，值 bit15:0）
+                  0x0938 HeartbeatTimeout (RW)
+                  0x093C/0x0940 时间戳 tick 频率 = 1 GHz（Leader 时间戳单位 = ns） -->
+
+        <Category Name="TransportLayerControl" NameSpace="Standard">
+                <pFeature>GevHeartbeatTimeout</pFeature>
+                <pFeature>GevTimestampTickFrequency</pFeature>
+                <pFeature>GevSCPHostPort</pFeature>
+                <pFeature>GevSCPSPacketSize</pFeature>
+                <pFeature>GevSCPSFireTestPacket</pFeature>
+                <pFeature>GevSCPSDoNotFragment</pFeature>
+                <pFeature>GevSCPSBigEndian</pFeature>
+                <pFeature>GevSCPD</pFeature>
+                <pFeature>GevSCDA</pFeature>
+                <pFeature>GevSCSP</pFeature>
+        </Category>
+
+        <Integer Name="GevHeartbeatTimeout" NameSpace="Standard">
+                <Visibility>Expert</Visibility>
+                <pValue>GevHeartbeatTimeoutReg</pValue>
+                <Min>500</Min>
+                <Max>3600000</Max>
+        </Integer>
+        <IntReg Name="GevHeartbeatTimeoutReg" NameSpace="Custom">
+                <Address>0x00000938</Address>
+                <Length>4</Length>
+                <AccessMode>RW</AccessMode>
+                <pPort>Device</pPort>
+                <Sign>Unsigned</Sign>
+                <Endianess>BigEndian</Endianess>
+        </IntReg>
+
+        <Integer Name="GevTimestampTickFrequency" NameSpace="Standard">
+                <Visibility>Expert</Visibility>
+                <pValue>GevTimestampTickFrequencyKn</pValue>
+        </Integer>
+        <IntSwissKnife Name="GevTimestampTickFrequencyKn" NameSpace="Custom">
+                <pVariable Name="HIGH">TimestampTickFrequencyHighReg</pVariable>
+                <pVariable Name="LOW">TimestampTickFrequencyLowReg</pVariable>
+                <Formula>(HIGH&lt;&lt;32)|LOW</Formula>
+        </IntSwissKnife>
+        <IntReg Name="TimestampTickFrequencyHighReg" NameSpace="Custom">
+                <Visibility>Invisible</Visibility>
+                <Address>0x0000093C</Address>
+                <Length>4</Length>
+                <AccessMode>RO</AccessMode>
+                <pPort>Device</pPort>
+                <Sign>Unsigned</Sign>
+                <Endianess>BigEndian</Endianess>
+        </IntReg>
+        <IntReg Name="TimestampTickFrequencyLowReg" NameSpace="Custom">
+                <Visibility>Invisible</Visibility>
+                <Address>0x00000940</Address>
+                <Length>4</Length>
+                <AccessMode>RO</AccessMode>
+                <pPort>Device</pPort>
+                <Sign>Unsigned</Sign>
+                <Endianess>BigEndian</Endianess>
+        </IntReg>
+
+        <!-- 接收端（应用）端口：aravis 建流/测试包前写入其 UDP socket 端口 -->
+        <Integer Name="GevSCPHostPort" NameSpace="Standard">
+                <Visibility>Expert</Visibility>
+                <pValue>GevSCPHostPortReg</pValue>
+        </Integer>
+        <MaskedIntReg Name="GevSCPHostPortReg" NameSpace="Custom">
+                <Address>0x00000D00</Address>
+                <Length>4</Length>
+                <AccessMode>RW</AccessMode>
+                <pPort>Device</pPort>
+                <Cachable>NoCache</Cachable>
+                <LSB>31</LSB>
+                <MSB>16</MSB>
+                <Sign>Unsigned</Sign>
+                <Endianess>BigEndian</Endianess>
+        </MaskedIntReg>
+
+        <!-- 包大小 = IP 包总字节数；aravest 二分搜索的边界来自 Min/Max/Inc -->
+        <Integer Name="GevSCPSPacketSize" NameSpace="Standard">
+                <Visibility>Expert</Visibility>
+                <pValue>GevSCPSPacketSizeReg</pValue>
+                <Min>576</Min>
+                <Max>1500</Max>
+                <Inc>4</Inc>
+        </Integer>
+        <MaskedIntReg Name="GevSCPSPacketSizeReg" NameSpace="Custom">
+                <Address>0x00000D04</Address>
+                <Length>4</Length>
+                <AccessMode>RW</AccessMode>
+                <pPort>Device</pPort>
+                <Cachable>NoCache</Cachable>
+                <LSB>31</LSB>
+                <MSB>16</MSB>
+                <Sign>Unsigned</Sign>
+                <Endianess>BigEndian</Endianess>
+        </MaskedIntReg>
+
+        <!-- GenApi Bit 0 = 寄存器值 bit31（arvgcregisternode.c: lsb = 32 - Bit - 1） -->
+        <Command Name="GevSCPSFireTestPacket" NameSpace="Standard">
+                <pValue>GevSCPSFireTestPacketReg</pValue>
+                <CommandValue>1</CommandValue>
+        </Command>
+        <MaskedIntReg Name="GevSCPSFireTestPacketReg" NameSpace="Custom">
+                <Address>0x00000D04</Address>
+                <Length>4</Length>
+                <AccessMode>RW</AccessMode>
+                <pPort>Device</pPort>
+                <Cachable>NoCache</Cachable>
+                <Bit>0</Bit>
+                <Endianess>BigEndian</Endianess>
+        </MaskedIntReg>
+
+        <Boolean Name="GevSCPSDoNotFragment" NameSpace="Standard">
+                <Visibility>Expert</Visibility>
+                <pValue>GevSCPSDoNotFragmentReg</pValue>
+        </Boolean>
+        <MaskedIntReg Name="GevSCPSDoNotFragmentReg" NameSpace="Custom">
+                <Address>0x00000D04</Address>
+                <Length>4</Length>
+                <AccessMode>RW</AccessMode>
+                <pPort>Device</pPort>
+                <Cachable>NoCache</Cachable>
+                <Bit>1</Bit>
+                <Endianess>BigEndian</Endianess>
+        </MaskedIntReg>
+
+        <Boolean Name="GevSCPSBigEndian" NameSpace="Standard">
+                <Visibility>Expert</Visibility>
+                <pValue>GevSCPSBigEndianReg</pValue>
+        </Boolean>
+        <MaskedIntReg Name="GevSCPSBigEndianReg" NameSpace="Custom">
+                <Address>0x00000D04</Address>
+                <Length>4</Length>
+                <AccessMode>RW</AccessMode>
+                <pPort>Device</pPort>
+                <Cachable>NoCache</Cachable>
+                <Bit>2</Bit>
+                <Endianess>BigEndian</Endianess>
+        </MaskedIntReg>
+
+        <Integer Name="GevSCPD" NameSpace="Standard">
+                <Visibility>Expert</Visibility>
+                <pValue>GevSCPDReg</pValue>
+        </Integer>
+        <IntReg Name="GevSCPDReg" NameSpace="Custom">
+                <Address>0x00000D08</Address>
+                <Length>4</Length>
+                <AccessMode>RW</AccessMode>
+                <pPort>Device</pPort>
+                <Cachable>NoCache</Cachable>
+                <Sign>Unsigned</Sign>
+                <Endianess>BigEndian</Endianess>
+        </IntReg>
+
+        <Integer Name="GevSCDA" NameSpace="Standard">
+                <Visibility>Expert</Visibility>
+                <pValue>GevSCDAReg</pValue>
+        </Integer>
+        <IntReg Name="GevSCDAReg" NameSpace="Custom">
+                <Address>0x00000D18</Address>
+                <Length>4</Length>
+                <AccessMode>RW</AccessMode>
+                <pPort>Device</pPort>
+                <Cachable>NoCache</Cachable>
+                <Sign>Unsigned</Sign>
+                <Endianess>BigEndian</Endianess>
+        </IntReg>
+
+        <!-- 相机流源端口（RO）：GvspTransmitter 绑定端口启动时回填 -->
+        <Integer Name="GevSCSP" NameSpace="Standard">
+                <Visibility>Expert</Visibility>
+                <pValue>GevSCSPReg</pValue>
+        </Integer>
+        <MaskedIntReg Name="GevSCSPReg" NameSpace="Custom">
+                <Address>0x00000D1C</Address>
+                <Length>4</Length>
+                <AccessMode>RO</AccessMode>
+                <pPort>Device</pPort>
+                <Cachable>NoCache</Cachable>
+                <LSB>31</LSB>
+                <MSB>16</MSB>
+                <Sign>Unsigned</Sign>
+                <Endianess>BigEndian</Endianess>
+        </MaskedIntReg>
+
+        <!-- ================================ Ports ================================ -->
+
+        <Port Name="Device" NameSpace="Standard"> </Port>
+
+        <Port Name="ChunkPort" NameSpace="Custom">
+                <ChunkID>0x00000001</ChunkID>
+        </Port>
+
+</RegisterDescription>
