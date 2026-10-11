@@ -80,14 +80,19 @@ public sealed class GvspTransmitter : IDisposable
     }
 
     /// <summary>
-    /// 发送一帧：Leader(packet_id=0) → Data(1..N，每片 ≤ packetSize-8 字节) → Trailer(N+1)。
+    /// 发送一帧：Leader(packet_id=0) → Data(1..N，每片 ≤ packetSize-8 字节) → Trailer(末包+1)。
     /// 整帧（含 Leader/Trailer）先写入 PacketCache 再逐包发送；packetDelayUs &gt; 0 时包间限速。
     /// <paramref name="leaderPayloadType"/>：Chunk 模式传 0x4001（image | chunk 位）；
-    /// <paramref name="trailerChunkBlock"/>：Chunk 模式时追加在 Trailer 负载后的原始块
+    /// <paramref name="chunkBlock"/>：Chunk 模式时追加在<b>数据流末尾</b>的原始块
     /// （如 [Width][Height][ChunkID][Size] 16 字节），null = 普通图像帧。
+    /// <para>Chunk 块装载策略（Aravis 兼容关键点）：Aravis 从 received_size-8 反向扫描
+    /// [ChunkID][Size] 块，而 received_size 只统计数据包负载字节（Trailer 包不计入），
+    /// 因此 Chunk 字节必须落在数据流内：优先并入最后一个数据包（不超分片上限时），
+    /// 否则作为独立数据包（packet_id=N+1）发送。两种布局均与 Aravis 按负载总量
+    /// ceil((payload)/block)+2 推导的包数、Trailer 位置约束一致。</para>
     /// </summary>
     public void SendFrame(FrameBuffer frame, IPAddress destIp, int destPort, ushort blockId, ushort packetSize,
-        uint packetDelayUs, ushort leaderPayloadType = GvspPacket.PayloadTypeImage, byte[]? trailerChunkBlock = null)
+        uint packetDelayUs, ushort leaderPayloadType = GvspPacket.PayloadTypeImage, byte[]? chunkBlock = null)
     {
         ArgumentNullException.ThrowIfNull(frame);
         if (destIp is null)
@@ -113,28 +118,48 @@ public sealed class GvspTransmitter : IDisposable
         // 组包：[0]=Leader，[1..N]=Data（packet_id 1..N），[N+1]=Trailer
         ReadOnlySpan<byte> pixels = frame.Data;
         int dataCount = (pixels.Length + chunkSize - 1) / chunkSize;
-        var packets = new byte[dataCount + 2][];
+
+        // Chunk 块装载：末包剩余空间足够则并入末包，否则独立成包（见方法注释）
+        bool chunkExtraPacket = false;
+        if (chunkBlock is { Length: > 0 })
+        {
+            int lastDataLen = dataCount > 0 ? pixels.Length - (dataCount - 1) * chunkSize : 0;
+            chunkExtraPacket = dataCount == 0 || lastDataLen + chunkBlock.Length > chunkSize;
+        }
+
+        int totalDataPackets = dataCount + (chunkExtraPacket ? 1 : 0);
+        var packets = new byte[totalDataPackets + 2][];
         packets[0] = GvspPacket.BuildLeader(blockId, frame.TimestampNs, (uint)frame.Format, (uint)frame.Width,
             (uint)frame.Height, leaderPayloadType);
         ushort packetId = 1;
         for (int offset = 0; offset < pixels.Length; offset += chunkSize)
         {
             int len = Math.Min(chunkSize, pixels.Length - offset);
-            packets[packetId] = GvspPacket.BuildData(packetId, blockId, pixels.Slice(offset, len));
+            if (chunkBlock is { Length: > 0 } && !chunkExtraPacket && offset + len >= pixels.Length)
+            {
+                // Chunk 块并入最后一个数据包（数据包负载 = 图像尾片 + Chunk 块）
+                var merged = new byte[len + chunkBlock.Length];
+                pixels.Slice(offset, len).CopyTo(merged);
+                chunkBlock.CopyTo(merged, len);
+                packets[packetId] = GvspPacket.BuildData(packetId, blockId, merged);
+            }
+            else
+            {
+                packets[packetId] = GvspPacket.BuildData(packetId, blockId, pixels.Slice(offset, len));
+            }
+
+            packetId++;
+        }
+
+        if (chunkExtraPacket && chunkBlock is { Length: > 0 })
+        {
+            // 末包已满（或并入超限）：Chunk 块独立成包，packet_id 紧随图像数据包
+            packets[packetId] = GvspPacket.BuildData(packetId, blockId, chunkBlock);
             packetId++;
         }
 
         var trailer = GvspPacket.BuildTrailer(blockId, (uint)frame.Height, leaderPayloadType);
-        if (trailerChunkBlock is { Length: > 0 })
-        {
-            // Chunk 模式：Trailer 负载后追加原始 Chunk 块（Trailer 包总长 = 8 + 8 + chunk.Length）
-            var extended = new byte[trailer.Length + trailerChunkBlock.Length];
-            trailer.CopyTo(extended, 0);
-            trailerChunkBlock.CopyTo(extended, trailer.Length);
-            trailer = extended;
-        }
-
-        GvspPacket.SetPacketId(trailer, (ushort)(dataCount + 1));   // Trailer 的 packet_id = N+1
+        GvspPacket.SetPacketId(trailer, (ushort)(totalDataPackets + 1));   // Trailer 的 packet_id = N+1
         packets[^1] = trailer;
 
         _cache.Store(blockId, packets);   // 整帧入缓存（重发窗口最近 4 帧）

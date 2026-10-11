@@ -223,13 +223,20 @@
 
         <Integer Name="PayloadSize" NameSpace="Standard">
                 <Visibility>Invisible</Visibility>
-                <pValue>PayloadSizeKn</pValue>
+                <pValue>PayloadSizeReg</pValue>
         </Integer>
-        <IntSwissKnife Name="PayloadSizeKn" NameSpace="Custom">
-                <pVariable Name="W">Width</pVariable>
-                <pVariable Name="H">Height</pVariable>
-                <Formula>W*H</Formula>
-        </IntSwissKnife>
+        <!-- PayloadSize 直读设备寄存器 0x00140018（NoCache）：与 GVCP 原始读同源，
+             Chunk 模式切换（+16 字节 Chunk 块）时由设备侧 UpdatePayloadSize 维护；
+             客户端按本值分配缓冲，确保数据流末尾的 Chunk 块不被截断。 -->
+        <IntReg Name="PayloadSizeReg" NameSpace="Custom">
+                <Address>0x00140018</Address>
+                <Length>4</Length>
+                <AccessMode>RO</AccessMode>
+                <pPort>Device</pPort>
+                <Cachable>NoCache</Cachable>
+                <Sign>Unsigned</Sign>
+                <Endianess>BigEndian</Endianess>
+        </IntReg>
 
         <!-- ========================= AcquisitionControl ========================== -->
 
@@ -417,10 +424,11 @@
 
         <!-- ============================= ChunkControl ============================ -->
 
-        <!-- Chunk 数据块（GVSP Trailer 追加，共 16 字节）：
+        <!-- Chunk 数据块（并入 GVSP 数据流末尾，共 16 字节）：
                   [Width u32 BE][Height u32 BE][ChunkID=0x00000001 u32 BE][Size=8 u32 BE]
-              ChunkID 必须与下方 <ChunkID> 一致；aravis 按 id 定位后以
-              「chunk 数据内偏移」访问 ChunkWidthReg/ChunkHeightReg。 -->
+              ChunkID 必须与下方 <ChunkID> 一致；aravis 从 received_size-8 反向扫描，
+              而 received_size 只统计数据包负载字节（Trailer 包不计入），因此本块
+              必须落在最后一个数据包内（或独立数据包），不可挂在 Trailer 上。 -->
         <Category Name="ChunkControl" NameSpace="Standard">
                 <pFeature>ChunkModeActive</pFeature>
                 <pFeature>ChunkSelector</pFeature>

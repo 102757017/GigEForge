@@ -96,6 +96,9 @@ public sealed class VirtualCamera : IDisposable, IGvcpCallbacks
     /// <summary>Chunk 模式 Leader/Trailer 的 payload_type（image | chunk 位）。</summary>
     private const ushort PayloadTypeImageChunk = 0x4001;
 
+    /// <summary>Chunk 块字节数：[Width u32][Height u32][ChunkID u32][Size u32]，并入数据流末尾（含于 PayloadSize）。</summary>
+    private const int ChunkTrailerBlockSize = 16;
+
     /// <summary>触发模式下等待 TriggerSoftware 的超时（毫秒）。</summary>
     private const int TriggerWaitMs = 1000;
 
@@ -538,7 +541,9 @@ public sealed class VirtualCamera : IDisposable, IGvcpCallbacks
     }
 
     /// <summary>解析流目的地并发送一帧；目的地/端口无效或流通道未绑定时静默跳过（仅产帧与事件）。
-    /// Chunk 模式（GenICam ChunkModeActive=1）时 Leader/Trailer payload_type=0x4001 且 Trailer 追加 Chunk 块。</summary>
+    /// Chunk 模式（GenICam ChunkModeActive=1）时 Leader/Trailer payload_type=0x4001，
+    /// 且 Chunk 块并入<b>数据流末尾</b>——Aravis 只扫描数据包负载区间（received_size），
+    /// Trailer 包字节不计入，故 Chunk 块不可挂在 Trailer 上。</summary>
     private void SendFrame(FrameBuffer frame)
     {
         (IPAddress? destination, int port) = ResolveStreamTarget();
@@ -555,15 +560,18 @@ public sealed class VirtualCamera : IDisposable, IGvcpCallbacks
     }
 
     /// <summary>
-    /// Chunk 模式 Trailer 追加块（16 字节，ChunkID 与 GigEForge.xml 的 &lt;ChunkID&gt;0x00000001 一致）：
+    /// Chunk 模式数据流末尾追加块（16 字节，ChunkID 与 GigEForge.xml 的 &lt;ChunkID&gt;0x00000001 一致）：
     /// [Width u32 BE][Height u32 BE][ChunkID=1 u32 BE][Size=8 u32 BE]；
     /// ChunkWidth/ChunkHeight 节点以 ChunkPort 基址 + 内偏移 0/4 读取本块。
+    /// 块由 GvspTransmitter.SendFrame 并入最后一个数据包（末包满时独立成包）——
+    /// Aravis 的 arv_buffer_get_chunk_data 从 received_size-8 反向扫描 [ID][Size]，
+    /// 而 received_size 只统计数据包负载字节，因此本块必须落在数据流内。
     /// </summary>
     private static byte[] BuildChunkTrailerBlock(FrameBuffer frame)
     {
         uint w = (uint)frame.Width;
         uint h = (uint)frame.Height;
-        var block = new byte[16];
+        var block = new byte[ChunkTrailerBlockSize];
         block[0] = (byte)(w >> 24);
         block[1] = (byte)(w >> 16);
         block[2] = (byte)(w >> 8);
@@ -602,6 +610,42 @@ public sealed class VirtualCamera : IDisposable, IGvcpCallbacks
         ushort id = _blockId;
         _blockId = id == LastBlockId ? (ushort)1 : (ushort)(id + 1);
         return id;
+    }
+
+    /// <summary>
+    /// 软触发信号（守卫式释放）：TriggerSoftware 以极短间隔连续写入时，采集线程可能尚未
+    /// 消费上一个信号，直接 Release 会抛 SemaphoreFullException（信号量计数超过上限，
+    /// 异常会以「GVCP 报文处理异常」形式上抛到 GvcpServer 日志）。满计数时丢弃本次触发——
+    /// 与真实相机在曝光/读出期间收到触发即忽略的行为一致。
+    /// </summary>
+    private void SignalSoftwareTrigger()
+    {
+        if (_softwareTrigger.CurrentCount == 0)
+        {
+            try
+            {
+                _softwareTrigger.Release();
+            }
+            catch (SemaphoreFullException)
+            {
+                // 并发竞态下重复释放：丢弃本次触发（ GVCP 处理线程与采集线程同时竞争的极小概率场景）
+            }
+        }
+    }
+
+    /// <summary>清空未消费的软触发信号（TriggerMode 切回 Off 时调用，避免残留信号在下次开启时立即出帧）。</summary>
+    private void DrainSoftwareTrigger()
+    {
+        try
+        {
+            while (_softwareTrigger.CurrentCount > 0 && _softwareTrigger.Wait(0))
+            {
+            }
+        }
+        catch (ObjectDisposedException)
+        {
+            // 相机已释放，忽略
+        }
     }
 
     private static void JoinThread(Thread? thread)
@@ -777,7 +821,14 @@ public sealed class VirtualCamera : IDisposable, IGvcpCallbacks
             });
         _registers.DefineRegister(GevFeature.TriggerMode, 0, "GenTriggerMode",
             validate: value => value <= 1 ? GevStatus.Success : GevStatus.InvalidParameter,
-            onWrite: value => _triggerMode = value);
+            onWrite: value =>
+            {
+                _triggerMode = value;
+                if (value == 0)
+                {
+                    DrainSoftwareTrigger();   // 关闭触发模式时清空未消费的软触发信号，避免开启后残留出帧
+                }
+            });
         _registers.DefineRegister(GevFeature.TriggerSource, 1, "GenTriggerSource",
             validate: value => value <= 1 ? GevStatus.Success : GevStatus.InvalidParameter);
         _registers.DefineRegister(GevFeature.TriggerSoftware, 0, "GenTriggerSoftware",
@@ -785,7 +836,7 @@ public sealed class VirtualCamera : IDisposable, IGvcpCallbacks
             {
                 if (value == 1)
                 {
-                    _softwareTrigger.Release();   // 触发一帧（采集线程在触发模式下等待本信号）
+                    SignalSoftwareTrigger();   // 触发一帧（守卫式释放，采集线程在触发模式下等待本信号）
                 }
             });
         _registers.DefineRegister(GevFeature.ExposureTime, FloatToBits(10000f), "GenExposureTime");
@@ -803,7 +854,11 @@ public sealed class VirtualCamera : IDisposable, IGvcpCallbacks
             validate: value => value == 0 ? GevStatus.Success : GevStatus.InvalidParameter);
         _registers.DefineRegister(GevFeature.ChunkModeActive, 0, "GenChunkModeActive",
             validate: value => value <= 1 ? GevStatus.Success : GevStatus.InvalidParameter,
-            onWrite: value => _chunkModeActive = value != 0);
+            onWrite: value =>
+            {
+                _chunkModeActive = value != 0;
+                UpdatePayloadSize();   // Chunk 模式切换同步刷新 PayloadSize（+/- 16 字节 Chunk 块）
+            });
         _registers.DefineRegister(GevFeature.ChunkEnableWidth, 1, "GenChunkEnableWidth",
             validate: value => value <= 1 ? GevStatus.Success : GevStatus.InvalidParameter);
         _registers.DefineRegister(GevFeature.ChunkEnableHeight, 1, "GenChunkEnableHeight",
@@ -961,9 +1016,11 @@ public sealed class VirtualCamera : IDisposable, IGvcpCallbacks
         Log?.Invoke($"已发送测试包（FireTestPacket，UDP 载荷 {payload}B → {destination}:{port}）");
     }
 
-    /// <summary>PayloadSize = W × H × 每像素字节数（契约 5.5）。</summary>
+    /// <summary>PayloadSize = W × H × 每像素字节数（契约 5.5）；Chunk 模式追加 16 字节 Chunk 块
+    /// （Aravis 按负载容量分配缓冲，数据流内的 Chunk 块必须计入负载，否则末包被裁剪）。</summary>
     private uint ComputePayloadSize() =>
-        (uint)((long)_config.Width * _config.Height * PixelFormatEx.BytesPerPixel(_config.Format));
+        (uint)((long)_config.Width * _config.Height * PixelFormatEx.BytesPerPixel(_config.Format)
+               + (_chunkModeActive ? ChunkTrailerBlockSize : 0));
 
     /// <summary>
     /// 宽/高/格式变更成功落表后刷新负载寄存器（0x00140018）。

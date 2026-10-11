@@ -77,7 +77,7 @@
 | `0x00010034` | GenGain | RW | IEEE754 单精度位图（dB，XML `<Float>` 0..12） |
 | `0x00010038` | GenFrameRate | RW | IEEE754 单精度位图（Hz，写后联动引擎 fps） |
 | `0x0001003C` | GenTriggerActivation | RW | 仅 0（RisingEdge） |
-| `0x00010040` | GenChunkModeActive | RW | 0/1（1 时 Leader/Trailer payload_type=0x4001 且 Trailer 追加 Chunk 块） |
+| `0x00010040` | GenChunkModeActive | RW | 0/1（1 时 Leader/Trailer payload_type=0x4001，且 Chunk 块并入数据流末尾——Aravis 只扫描数据包负载区间，Trailer 包不计入 received_size） |
 | `0x00010044` | GenChunkEnableWidth | RW | 0/1（ChunkSelector=Width 时 ChunkEnable 写入处） |
 | `0x00010048` | GenChunkEnableHeight | RW | 0/1 |
 | `0x0001004C` | GenChunkSelector | RW | 0=Width 1=Height |
@@ -307,7 +307,7 @@ GenICam 标准特性区（XML）仅枚举 **Mono8**（`0x01080001`）；设备�
 - 标准引导区：版本/设备模式/MAC/IP 配置/名称区/XML URL×2/接口与通道计数/XML 清单（0x920-0x930，动态大小+CRC32）/
   GVCP 能力位图（0x7）/时间戳寄存器（1 GHz tick）；
 - GVSP：Leader/Data/Trailer（经典模式单流通道）、block_id 回绕、包重发（缓存 4 帧）、
-  包大小/包间延迟可调、FireTestPacket 测试包（载荷精确 size−28）、Chunk 模式（payload_type 0x4001 + Trailer 追加块）、
+  包大小/包间延迟可调、FireTestPacket 测试包（载荷精确 size−28）、Chunk 模式（payload_type 0x4001 + 数据流末尾追加 Chunk 块）、
   软触发（TriggerMode/TriggerSoftware）与 SingleFrame 自动停；
 - GenICam：GenApi XML v2 模板（嵌入资源 `GenICam/GigEForge.xml` + 身份注入，DeviceControl / ImageFormatControl /
   AcquisitionControl / AnalogControl / ChunkControl / TransportLayerControl 全特性，含
